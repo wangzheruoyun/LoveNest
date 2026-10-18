@@ -336,6 +336,15 @@
     },
     arch: function () {
       return 'arm64';
+    },
+    // The engine divides these by a unit to render a GB figure. As with
+    // memoryUsage(), a browser cannot report real system memory, so return
+    // stable non-zero byte counts rather than let the arithmetic produce NaN.
+    totalmem: function () {
+      return 6442450944; // 6 GiB
+    },
+    freemem: function () {
+      return 3221225472; // 3 GiB
     }
   };
 
@@ -450,8 +459,10 @@
 
   /**
    * A lazy no-op stand-in for a module the shim does not provide. Every
-   * property is another callable no-op, so `require('whatever').a.b.c()` is
-   * harmless instead of a TypeError that would kill the engine.
+   * property is another callable no-op, and calling or `new`-ing a no-op
+   * yields another one, so arbitrary chains such as
+   * `require('x').a().b.c()` or `new (require('x').Thing)().z` are harmless
+   * instead of a TypeError that would kill engine startup.
    */
   function createNoop() {
     var noop = function () {};
@@ -461,24 +472,30 @@
       // throw. (Every real target has Proxy: Chromium WebView and Node.)
       return noop;
     }
+    function child(target) {
+      if (!target.__noop) target.__noop = createNoop();
+      return target.__noop;
+    }
     return new Proxy(noop, {
       get: function (target, prop) {
         if (prop === 'then') return undefined;
         if (typeof prop === 'symbol') return undefined;
-        if (!target.__noop) target.__noop = createNoop();
-        return target.__noop;
+        return child(target);
+      },
+      // Deliberately permissive and unresolved: we have no evidence which way
+      // the engine's feature-detection wants `in` to answer, and answering
+      // `false` could silently disable code paths. Leave it permissive.
+      has: function () {
+        return true;
       },
       set: function () {
         return true;
       },
-      has: function () {
-        return true;
+      apply: function (target) {
+        return child(target);
       },
-      apply: function () {
-        return undefined;
-      },
-      construct: function () {
-        return {};
+      construct: function (target) {
+        return child(target);
       }
     });
   }
@@ -502,5 +519,10 @@
   if (win) {
     win.require = requireModule;
     win.process = processObject;
+    // Stable introspection hook for the headless harness (and on-device
+    // debugging). Double-underscore namespaced so it cannot collide with an
+    // engine global; Ruling 1's no-escape-check behaviour of resolvePath is
+    // pinned by a test through this hook.
+    win.__gcBridge = { resolvePath: resolvePath, toBuffer: toBuffer };
   }
 })();

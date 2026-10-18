@@ -47,3 +47,32 @@ test('os.homedir() 指向手机 Documents 根', () => {
   const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
   assert.strictEqual(w.require('os').homedir(), '/tmp/d');
 });
+
+test('os.totalmem()/freemem() 返回稳定非零字节数', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const os = w.require('os');
+  assert.strictEqual(typeof os.totalmem, 'function');
+  assert.strictEqual(typeof os.freemem, 'function');
+  assert.ok(os.totalmem() > 0);
+  assert.ok(os.freemem() > 0);
+});
+
+test('未知模块的 no-op 代理可安全链式调用与 new', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const mod = w.require('some-unknown-module');
+  assert.strictEqual(typeof mod.a().b, 'function');
+  assert.strictEqual(typeof mod.fn().deeper().x, 'function');
+  assert.strictEqual(typeof new mod.Thing().other, 'function');
+  assert.strictEqual(typeof mod.a.b.c(), 'function', '调用链末端调用仍返回 no-op，绝不抛异常');
+});
+
+test('resolvePath() 仅做词法拼接，不对爬升路径做逃逸拒绝（Ruling 1）', () => {
+  const w = loadBridge(createHost({ gameRoot: '/srv/game', docsRoot: '/tmp/d' }));
+  const rp = w.__gcBridge.resolvePath;
+  assert.strictEqual(typeof rp, 'function');
+  assert.strictEqual(rp('asset/json/startup.json'), '/srv/game/asset/json/startup.json');
+  assert.strictEqual(rp('/srv/game/index.html'), '/srv/game/index.html');
+  // 相对爬升路径只做词法归一化，绝不在此处拒绝（逃逸判定归宿主）
+  assert.strictEqual(rp('../..'), '/');
+  assert.strictEqual(rp('../../etc/passwd'), '/etc/passwd');
+});
