@@ -813,7 +813,78 @@
     else fn();
   }
 
+  /**
+   * Minimal stream pair. The engine uses streams for file copies
+   * (`readable.pipe(writable)`) and for its trace log
+   * (`createWriteStream(...).on('finish', cb)`); a waiting `SyncTask` resumes
+   * only when that event fires. Events are deferred one macrotask, like
+   * Node's, so a listener registered immediately after `pipe()` / `end()`
+   * still sees them. The read side is served by the same synchronous
+   * `readFileSync` the rest of the shim uses; the write side only emits the
+   * lifecycle events, because the host's write path is a no-op.
+   */
+  function makeEmitter() {
+    var listeners = {};
+    return {
+      on: function (event, listener) {
+        var key = String(event);
+        if (typeof listener === 'function') {
+          (listeners[key] || (listeners[key] = [])).push(listener);
+        }
+        return this;
+      },
+      emit: function (event) {
+        var list = listeners[String(event)];
+        if (!list) return false;
+        var args = Array.prototype.slice.call(arguments, 1);
+        for (var i = 0; i < list.length; i++) list[i].apply(null, args);
+        return true;
+      }
+    };
+  }
+
+  function makeReadStream(p) {
+    var stream = makeEmitter();
+    stream.pipe = function (dest) {
+      defer(function () {
+        var bytes;
+        try {
+          bytes = fsModule.readFileSync(p);
+        } catch (err) {
+          stream.emit('error', err);
+          return;
+        }
+        stream.emit('data', bytes);
+        if (dest && typeof dest.write === 'function') dest.write(bytes);
+        if (dest && typeof dest.end === 'function') dest.end();
+        stream.emit('end');
+      });
+      return dest;
+    };
+    return stream;
+  }
+
+  function makeWriteStream() {
+    var stream = makeEmitter();
+    stream.write = function () { return true; };
+    stream.end = function () {
+      defer(function () {
+        stream.emit('finish');
+        stream.emit('close');
+      });
+      return stream;
+    };
+    return stream;
+  }
+
   var fsModule = {
+    constants: {
+      F_OK: 0,
+      X_OK: 1,
+      W_OK: 2,
+      R_OK: 4
+    },
+
     existsSync: function (p) {
       try {
         return hostCall('exists', resolvePath(p)) === true;
@@ -902,6 +973,72 @@
       if (info.isDirectory) throw fsError('EISDIR', 'unlink', abs);
       throw fsError('EACCES', 'unlink', abs);
     },
+
+    /**
+     * `access`/`accessSync` are used only as a readability / writability probe
+     * (`fs.constants.F_OK | R_OK`, `W_OK`). The host exposes reachability only,
+     * so existence is the whole test: a file that exists is reported readable,
+     * and — because the write path is a no-op on this host — writable too.
+     */
+    accessSync: function (p, mode) {
+      var abs = resolvePath(p);
+      if (!isWithinRoots(abs)) throw fsError('EACCES', 'access', abs);
+      if (hostCall('exists', abs) !== true) throw fsError('ENOENT', 'access', abs);
+      return undefined;
+    },
+
+    access: function (p, mode, cb) {
+      if (typeof mode === 'function') { cb = mode; mode = undefined; }
+      if (typeof cb !== 'function') return undefined;
+      defer(function () {
+        try {
+          fsModule.accessSync(p, mode);
+        } catch (err) {
+          cb(err);
+          return;
+        }
+        cb(null);
+      });
+      return undefined;
+    },
+
+    /**
+     * `copyFileSync` is built from the two primitives that exist, so it keeps
+     * Node's `ENOENT`-on-missing-source contract and lands the (no-op) write.
+     */
+    copyFileSync: function (src, dst) {
+      var bytes = fsModule.readFileSync(src);
+      fsModule.writeFileSync(dst, bytes);
+      return undefined;
+    },
+
+    /**
+     * `renameSync` / `rmdirSync` have no host primitive and the write path is a
+     * no-op, so they validate the same way Node does (root containment, source
+     * existence) and then report success without touching the game folder. A
+     * later read of the moved path therefore sees the old state — the accepted
+     * write-is-no-op limitation recorded in NOTES.md.
+     */
+    renameSync: function (oldPath, newPath) {
+      var from = resolvePath(oldPath);
+      var to = resolvePath(newPath);
+      if (!isWithinRoots(from)) throw fsError('EACCES', 'rename', from);
+      if (!isWithinRoots(to)) throw fsError('EACCES', 'rename', to);
+      if (hostCall('exists', from) !== true) throw fsError('ENOENT', 'rename', from);
+      return undefined;
+    },
+
+    rmdirSync: function (p) {
+      var abs = resolvePath(p);
+      if (!isWithinRoots(abs)) throw fsError('EACCES', 'rmdir', abs);
+      var info = parseStat(hostCall('stat', abs));
+      if (!info) throw fsError('ENOENT', 'rmdir', abs);
+      if (!info.isDirectory) throw fsError('ENOTDIR', 'rmdir', abs);
+      return undefined;
+    },
+
+    createReadStream: makeReadStream,
+    createWriteStream: makeWriteStream,
 
     /* ---- asynchronous forms: the sync implementation, deferred ---- */
 
@@ -1407,12 +1544,91 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * `Buffer`
+   *
+   * The engine's bundled Live2D WAsm loader decodes an embedded base64
+   * data-URI with `Buffer.from(str, 'base64')`. It reaches the global through
+   * `_getAttributeFromParentPages('Buffer')` (i.e. `globalThis.Buffer`), and
+   * feeds the result to `Uint8Array`/`fs.writeFile`, so a plain `Uint8Array`
+   * satisfies it: the loader only reads `.buffer`, `.byteOffset` and
+   * `.byteLength`, all present on a typed array. Node's `Buffer` is a
+   * `Uint8Array` subclass, so this is a faithful subset.
+   * ------------------------------------------------------------------ */
+
+  function BufferShim(value, encoding) {
+    if (typeof value === 'string') {
+      var enc = canonicalEncoding(encoding);
+      if (enc === 'base64') return toBuffer(value);
+      if (enc === 'latin1') return latin1Encode(value);
+      if (enc === 'ascii') return asciiEncode(value);
+      return utf8Encode(value);
+    }
+    return BufferShim.from(value);
+  }
+
+  BufferShim.from = function (data, encoding) {
+    if (typeof data === 'string') return BufferShim(data, encoding);
+    if (data === null || data === undefined) return new Uint8Array(0);
+    if (typeof Uint8Array !== 'undefined' && data instanceof Uint8Array) {
+      var copy = new Uint8Array(data.length);
+      for (var i = 0; i < data.length; i++) copy[i] = data[i];
+      return copy;
+    }
+    if (typeof ArrayBuffer !== 'undefined' && data instanceof ArrayBuffer) {
+      return new Uint8Array(data.slice(0));
+    }
+    if (typeof data.length === 'number') {
+      var out = new Uint8Array(data.length);
+      for (var j = 0; j < data.length; j++) out[j] = data[j] & 0xff;
+      return out;
+    }
+    throw new TypeError('Buffer.from: unsupported input type');
+  };
+
+  BufferShim.alloc = function (size) {
+    return new Uint8Array(size || 0);
+  };
+
+  BufferShim.allocUnsafe = function (size) {
+    return new Uint8Array(size || 0);
+  };
+
+  BufferShim.isBuffer = function (value) {
+    return (typeof Uint8Array !== 'undefined') && (value instanceof Uint8Array);
+  };
+
+  BufferShim.byteLength = function (value, encoding) {
+    if (typeof value === 'string') return BufferShim(value, encoding).length;
+    return value ? value.length : 0;
+  };
+
+  BufferShim.concat = function (list, totalLength) {
+    var items = list || [];
+    var total = totalLength;
+    var k;
+    if (total === undefined) {
+      total = 0;
+      for (k = 0; k < items.length; k++) total += items[k].length;
+    }
+    var result = new Uint8Array(total);
+    var offset = 0;
+    for (k = 0; k < items.length && offset < total; k++) {
+      var part = items[k];
+      var take = Math.min(part.length, total - offset);
+      for (var m = 0; m < take; m++) result[offset + m] = part[m];
+      offset += take;
+    }
+    return result;
+  };
+
+  /* ------------------------------------------------------------------ *
    * Publish the NW.js-ish environment
    * ------------------------------------------------------------------ */
 
   if (win) {
     win.require = requireModule;
     win.process = processObject;
+    win.Buffer = BufferShim;
     // Stable introspection hook for the headless harness (and on-device
     // debugging). Non-enumerable so an engine-wide `for...in window` /
     // `Object.keys(window)` scan never sees it, and non-writable so the engine

@@ -664,3 +664,138 @@ test('nw.gui Shell.openItem 走宿主的系统 Intent 打开文件', () => {
   assert.deepStrictEqual(opened, [GAME_ROOT + '/index.html']);
   assert.strictEqual(ok, true);
 });
+
+/* ------------------------------------------------------------------ *
+ * Task 5 — engine boot gaps (exposed by `run.js --inject`)
+ * ------------------------------------------------------------------ */
+
+test('fs.constants 暴露 F_OK/X_OK/W_OK/R_OK（Node 取值）', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const c = w.require('fs').constants;
+  // 这是启动时第一个 ReferenceError（W26_TraceConsole.ensureDirExists）。
+  assert.strictEqual(c.F_OK, 0);
+  assert.strictEqual(c.X_OK, 1);
+  assert.strictEqual(c.W_OK, 2);
+  assert.strictEqual(c.R_OK, 4);
+});
+
+test('fs.accessSync 用存在性判定可访问性，缺失 ENOENT、越界 EACCES', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const fsShim = w.require('fs');
+  const F_OK = fsShim.constants.F_OK;
+  assert.doesNotThrow(() => fsShim.accessSync(GAME_ROOT + '/index.html', F_OK));
+  assert.throws(() => fsShim.accessSync(GAME_ROOT + '/__nope__.png', F_OK),
+    (err) => err && err.code === 'ENOENT');
+  assert.throws(() => fsShim.accessSync('/etc/passwd', F_OK),
+    (err) => err && err.code === 'EACCES');
+});
+
+test('fs.copyFileSync 逐字节复制源文件并落到目标（经宿主 writeBase64）', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const writes = [];
+  host.writeBase64 = (p, b64) => { writes.push({ p: String(p), b64: String(b64) }); return true; };
+  const w = loadBridge(host);
+  const fsShim = w.require('fs');
+  fsShim.copyFileSync(GAME_ROOT + '/icon.png', '/tmp/d/icon-copy.png');
+  assert.strictEqual(writes.length, 1);
+  assert.strictEqual(writes[0].p, '/tmp/d/icon-copy.png');
+  assert.strictEqual(writes[0].b64, fs.readFileSync(GAME_ROOT + '/icon.png').toString('base64'));
+  assert.throws(() => fsShim.copyFileSync(GAME_ROOT + '/__nope__', '/tmp/d/x'),
+    (err) => err && err.code === 'ENOENT');
+});
+
+test('fs.renameSync 校验根与存在性后按 no-op 成功返回', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const fsShim = w.require('fs');
+  assert.doesNotThrow(() => fsShim.renameSync(GAME_ROOT + '/index.html', '/tmp/d/index.html'));
+  assert.throws(() => fsShim.renameSync(GAME_ROOT + '/__nope__', '/tmp/d/x'),
+    (err) => err && err.code === 'ENOENT');
+  assert.throws(() => fsShim.renameSync(GAME_ROOT + '/index.html', '/etc/passwd'),
+    (err) => err && err.code === 'EACCES');
+});
+
+test('fs.rmdirSync 目录成功、文件 ENOTDIR、缺失 ENOENT', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const fsShim = w.require('fs');
+  assert.doesNotThrow(() => fsShim.rmdirSync(GAME_ROOT + '/asset'));
+  assert.throws(() => fsShim.rmdirSync(GAME_ROOT + '/index.html'),
+    (err) => err && err.code === 'ENOTDIR');
+  assert.throws(() => fsShim.rmdirSync(GAME_ROOT + '/__nope__'),
+    (err) => err && err.code === 'ENOENT');
+});
+
+test('fs.createWriteStream 异步触发 finish 再 close（否则等待的 SyncTask 永挂起）', async () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const fsShim = w.require('fs');
+  const ws = fsShim.createWriteStream('/tmp/d/日志.txt', { flags: 'a' });
+  assert.strictEqual(ws.write('hello', 'utf8'), true);
+  const events = [];
+  ws.on('finish', () => events.push('finish'));
+  ws.on('close', () => events.push('close'));
+  ws.end();
+  assert.deepStrictEqual(events, [], 'finish/close 必须异步，先于监听器注册就不会触发');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepStrictEqual(events, ['finish', 'close']);
+});
+
+test('fs.createReadStream().pipe() 交付源文件字节并发出 end', async () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const fsShim = w.require('fs');
+  const chunks = [];
+  let ended = false;
+  let endEvent = false;
+  const dest = { write: (b) => { chunks.push(b); }, end: () => { ended = true; } };
+  const rs = fsShim.createReadStream(GAME_ROOT + '/index.html');
+  rs.on('end', () => { endEvent = true; });
+  rs.pipe(dest);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.strictEqual(chunks.length, 1);
+  assert.strictEqual(Buffer.from(chunks[0]).length, fs.statSync(GAME_ROOT + '/index.html').size);
+  assert.strictEqual(ended, true);
+  assert.strictEqual(endEvent, true);
+});
+
+test('fs.createReadStream 读缺失文件时发出 error 而非抛异常', async () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const fsShim = w.require('fs');
+  let err = null;
+  const rs = fsShim.createReadStream(GAME_ROOT + '/__nope__');
+  rs.on('error', (e) => { err = e; });
+  rs.pipe({ write: () => {}, end: () => {} });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(err && err.code === 'ENOENT');
+});
+
+test('window.Buffer.from(str,"base64") 与 Node 逐字节一致，并带 TypedArray 形状', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const B = w.Buffer;
+  assert.strictEqual(typeof B, 'function');
+  const original = fs.readFileSync(GAME_ROOT + '/icon.png');
+  const decoded = B.from(original.toString('base64'), 'base64');
+  assert.strictEqual(decoded.length, original.length);
+  assert.strictEqual(Buffer.compare(Buffer.from(decoded), original), 0);
+  assert.ok(decoded.buffer && typeof decoded.buffer.byteLength === 'number');
+  assert.strictEqual(typeof decoded.byteOffset, 'number');
+  assert.strictEqual(decoded.byteLength, decoded.length);
+  assert.strictEqual(B.isBuffer(decoded), true);
+  assert.strictEqual(B.isBuffer('not-a-buffer'), false);
+});
+
+test('new Buffer(str,"base64") 构造形式同样可用（Live2D wasm 加载器的兜底分支）', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const original = fs.readFileSync(GAME_ROOT + '/icon.png');
+  const viaNew = new w.Buffer(original.toString('base64'), 'base64');
+  assert.strictEqual(Buffer.compare(Buffer.from(viaNew), original), 0);
+});
+
+test('Buffer.from(Uint8Array) 复制而非共享底层字节', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const B = w.Buffer;
+  const src = new Uint8Array([1, 2, 3]);
+  const copy = B.from(src);
+  copy[0] = 9;
+  assert.strictEqual(src[0], 1, 'Node 的 Buffer.from 是拷贝语义');
+  assert.strictEqual(B.byteLength('abc'), 3);
+  assert.strictEqual(B.from('héllo', 'utf8').length, 6);
+  assert.strictEqual(B.alloc(4).length, 4);
+});

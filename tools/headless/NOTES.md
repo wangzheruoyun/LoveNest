@@ -159,6 +159,96 @@ white with a broken-image glyph, as expected with no shim.
    contract test above asserts the game tree is byte-identical after a
    representative workload.
 
+## Task 5 — `run.js --inject` boots the real game (measured)
+
+`node tools/headless/run.js --inject` → **exit 0**, `pageerrors = 0`,
+`environmental page errors = 0`. Transcript: `out/console.log`.
+
+| Assertion (plan Rulings 2 & 3) | Measured |
+|---|---|
+| `os.platform` | **2** (via `os.platform`, not the always-2 `Common.runPlatform` getter) |
+| `main()` invocations | **1** |
+| `<canvas>` in DOM | **true** |
+| `typeof window.require` | `function` |
+| `window.__gcBridge` | `true` |
+| first-screen load | **~1.6 s** (1572 ms / 1637 ms across two runs; navigation start → `window load`) |
+
+`run.js` now records `# load: <ms>` and prints `load = <ms>`; the number above is
+the 9.5 MB `script.js` parse plus engine init. Spec risk #5 (slow first screen)
+still does not materialise.
+
+### How `--inject` works
+
+`page.addInitScript()` (`buildInitScript()`), evaluated before any page script:
+
+1. `window.__GCNativeConfig = { gameRoot, docsRoot }`.
+2. `inpage-host.js` — the in-page twin of `host-native.js`, installing
+   `window.__GCNative` with the same 19 methods. Reads (`exists`/`stat`/
+   `readBase64`/`readDir`) use **synchronous `file://` XHR** with
+   `overrideMimeType('text/plain; charset=x-user-defined')`; each byte is
+   recovered via `charCodeAt(i) & 0xFF`. Bytes were verified identical to Node's
+   `.toString('base64')`. Writes (`writeBase64`/`mkdirp`/`unlink`) are logged
+   no-ops; Android-only capabilities log a line. No `http://` switch was needed —
+   the page stays on `file://`, as the plan required.
+3. `gc-bridge.js` unchanged in behaviour, extended with the globals the engine
+   also touches.
+
+`script.js` is served from disk through `page.route` (matched on
+`url.pathname.endsWith('/script.js')`, since the engine loads it as
+`script.js?r=…`) with `MAIN_COUNT_SNIPPET` appended. `main` is a writable global
+function declaration, so the counter wrapper survives; a `defineProperty` trap
+did not (hence the reassignment approach).
+
+### Globals/modules the shim had to add in Task 5
+
+Beyond Task 4's surface, the real engine also reached for: `fs.constants`
+(`F_OK`, `R_OK`, `W_OK`, `X_OK`) and `fs.accessSync`/`access`; `fs.copyFileSync`,
+`fs.renameSync`, `fs.rmdirSync`; `fs.createReadStream`/`createWriteStream` (a
+minimal emitter — `.pipe()` delivers bytes and ends cleanly, and a missing source
+emits `error` rather than throwing); and a `window.Buffer` shim (a `Uint8Array`
+subset — `Buffer.from`, `new Buffer`, base64 round-trips) because the bundled
+Live2D/Wasm loader resolves `Buffer` off `globalThis` via
+`_getAttributeFromParentPages('Buffer')`. `window.require` (already the Task 4
+fix) is what makes `os.platform` and `W26_WindowsFullName.get()` succeed.
+
+**`fetch` was deliberately *not* overridden.** The only `fetch(` call site in the
+engine is `fetch('https://api.ip.sb/geoip')` (`rv.js:92561`); the other
+occurrences live inside the WAsm loader behind `typeof fetch` guards. The host
+never serves local files through `fetch`, so there is nothing to shim. If a
+future engine build does read local files with `fetch`, override `window.fetch`
+in the init script at that point rather than pre-emptively.
+
+### Residual, expected output (none of it a `pageerror`)
+
+- `43` `[requestfailed]` lines: the Demo's genuinely missing
+  `btn_normal/over/click.png` and first-run-missing `savedata/life.gcdata(.bak)`,
+  `asset/json/ui/uiCompSetting.json`, plus documented save/wallpaper paths under
+  `晴小姐\日记.txt` and `\AppData\Roaming\cicigames`. All are `ERR_FILE_NOT_FOUND`
+  (or the loopback `:ffff:` equivalents), i.e. *absence*, not corruption.
+- `22` `[host:…]` no-op / Android-capability log lines — proof the host was
+  actually called.
+- Offline `当前城市: Tiruvānmiyūr` (geoip) and the `gamecreator.com.cn` OpenAPI
+  banner — spec risk #6, expected.
+- `writeBase64` was exercised (e.g. `life.gcdatabak`, 1836/3348 b64 chars) with
+  no error — the write path runs; it simply discards, because in-page writes are
+  no-ops by design. **This is a real limitation of the headless host: it cannot
+  verify that saves actually persist.** Persistence is Task 7/9's job on-device.
+
+### WebGL is blank here — environmental, not a port regression
+
+The injected run still emits `CONTEXT_LOST_WEBGL` (×1) and `shader error null`
+(×6) as **console** lines, and `out/screenshot.png` is a 6738-byte blank white
+frame. This is **not** caused by the shim: baseline B shows the identical
+context loss, and a sweep of launch flags changed nothing — default,
+`--use-gl=angle --use-angle=swiftshader`, `--enable-unsafe-swiftshader`, both
+combined, `--disable-gpu`, `--use-gl=swiftshader`, and even **headed under
+`xvfb-run`** all produce the same `lost:1, shader:6, size:6738` blank frame.
+Because no `run.js` launch arg helps, none was added — faking a visual check or
+swallowing the signal would be dishonest. The acceptance gate for Task 5 is
+therefore **zero engine `pageerror`s plus the three assertions above**, which is
+met; "the title screen is visibly drawn" cannot be confirmed on this machine and
+is recorded as a concern.
+
 ## Fallback plan if a browser ever becomes unavailable
 
 Not needed today, but recorded per the task brief. If Chromium cannot run, the
