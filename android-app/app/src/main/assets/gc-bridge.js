@@ -1051,31 +1051,41 @@
   }
 
   /**
-   * True for the parts of a popup command that are not user-visible text: the
-   * option keywords, the numeric flags, and the *executable / asset paths*.
-   *
-   * The paths matter. The engine builds every popup through
-   * `getNirCmdPath()` / `getTrayballoonPath()`, which wrap the exe in quotes
-   * (`"\"" + path + "\""`), and trayballoon additionally passes the icon as a
-   * game path. So the first quoted token of a real popup command is always an
-   * absolute filesystem path, and the icon argument is another one; both must
-   * be dropped or the toast shows internal paths instead of the gag text.
+   * Join the pieces of a notification body in order, skipping missing/empty
+   * ones, so an abbreviated command form still yields sensible text.
    */
-  function isPopupFlag(part) {
-    return part === '' || part === 'infobox' || part === 'qboxcom' ||
-      part.indexOf('MB_') === 0 || /^[0-9]+$/.test(part) ||
-      /\.(exe|scr|com|bat|cmd)$/i.test(part) ||
-      part.indexOf('/') !== -1 || part.indexOf('\\') !== -1;
-  }
-
-  /** Human-readable notification text from a Windows popup command. */
-  function popupMessage(parts) {
+  function joinText(parts) {
     var kept = [];
     for (var i = 0; i < parts.length; i++) {
-      var part = String(parts[i]);
-      if (!isPopupFlag(part)) kept.push(part);
+      var part = parts[i];
+      if (part !== undefined && part !== null && String(part) !== '') {
+        kept.push(String(part));
+      }
     }
     return kept.join(' ');
+  }
+
+  /**
+   * The user-visible text of a popup launched through `child_process`, taken by
+   * *position*.
+   *
+   * The engine's command forms are fixed (see the Task 4 report):
+   *   trayballoon.exe "<title>" "<content>" "<time>" "<iconType>" "<iconPath>"
+   *   nircmd.exe "infobox" "<content>" "<title>"
+   *   nircmd.exe "qboxcom" "<content>" "<title>" consolewrite yes
+   * so `quotedArgs` yields either `[exe, title, content, …]` or
+   * `[exe, messageType, content, title]`. Dropping the exe at index 0 and reading
+   * the known positions cannot touch the message text itself — an earlier
+   * shape-based filter ("contains a slash", "ends in .exe/.com") ate any body
+   * that was a fraction, a date, a path joke or a URL.
+   */
+  function popupTextFromArgs(args) {
+    var rest = Array.prototype.slice.call(args, 1); // drop the exe at index 0
+    var kind = rest.length > 0 ? String(rest[0]).toLowerCase() : '';
+    if (kind === 'qboxcom' || kind === 'infobox') {
+      return joinText([rest[1], rest[2]]); // messageType, content, title
+    }
+    return joinText([rest[0], rest[1]]); // trayballoon: title, content
   }
 
   /** True when a command is one of the engine's popups (tray balloon / box). */
@@ -1170,7 +1180,7 @@
     // Checked *before* the power verbs on purpose: a box whose body happens to
     // contain "shutdown" is still a box, and only the popup text is quoted.
     if (isPopupCommand(lower, tokens)) {
-      hostCall('toast', popupMessage(quotedArgs(text)));
+      hostCall('toast', popupTextFromArgs(quotedArgs(text)));
       return '';
     }
 
@@ -1238,8 +1248,10 @@
       var text = String(command == null ? '' : command);
       if (/messageshow/i.test(text)) {
         // `W26_MessageShow` runs MessageShow.exe for a Windows message box; the
-        // Android equivalent is a notification.
-        hostCall('toast', popupMessage(Array.isArray(args) ? args : []));
+        // Android equivalent is a notification. Unlike the `exec` forms, the exe
+        // is a separate argument here, so the args are already [content, title, …].
+        var parts = Array.isArray(args) ? args : [];
+        hostCall('toast', joinText([parts[0], parts[1]]));
       } else {
         hostCall('log', text);
       }

@@ -497,9 +497,47 @@ test('nircmd qboxcom 真实命令形态不泄漏路径，也不退出应用', ()
   // 引擎：... + ' "qboxcom" "<content>" "<title>" consolewrite yes'
   w.require('child_process').exec(exe + ' "qboxcom" "要退出吗" "确认" consolewrite yes');
   assert.strictEqual(toasts.length, 1);
+  assert.strictEqual(toasts[0], '要退出吗 确认', '正文与标题按引擎顺序、且只有它们');
   assert.ok(toasts[0].indexOf('要退出吗') >= 0, '正文必须传给 toast');
+  assert.ok(toasts[0].indexOf('consolewrite') < 0, 'qboxcom 的裸尾参数不得泄漏进提示');
   assert.ok(toasts[0].indexOf(GAME_ROOT) < 0, '内部路径不得泄漏');
   assert.strictEqual(shut, 0, 'qboxcom 不是关机命令');
+});
+
+test('提示正文含斜杠（分数）时不得被误当路径丢弃', () => {
+  const toasts = [];
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.toast = (m) => { toasts.push(String(m)); };
+  const w = loadBridge(host);
+  const exe = '"' + GAME_ROOT + '/asset/pcSys/nircmd.exe"';
+  w.require('child_process').execSync(exe + ' "infobox" "已经有 1/2 的进度了" "提示"');
+  assert.strictEqual(toasts.length, 1);
+  assert.strictEqual(toasts[0], '已经有 1/2 的进度了 提示', '含斜杠的正文必须完整保留');
+});
+
+test('提示正文含反斜杠（Windows 路径玩笑）时不得被误当路径丢弃', () => {
+  const toasts = [];
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.toast = (m) => { toasts.push(String(m)); };
+  const w = loadBridge(host);
+  const exe = '"' + GAME_ROOT + '/asset/pcSys/nircmd.exe"';
+  w.require('child_process').execSync(exe + ' "infobox" "C:\\Games\\love" "提示"');
+  assert.strictEqual(toasts.length, 1);
+  assert.strictEqual(toasts[0], 'C:\\Games\\love 提示', '含反斜杠的正文必须完整保留');
+});
+
+test('提示正文以 .com/.exe 结尾时不得被误当可执行文件丢弃', () => {
+  const toasts = [];
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.toast = (m) => { toasts.push(String(m)); };
+  const w = loadBridge(host);
+  const exe = '"' + GAME_ROOT + '/asset/pcSys/nircmd.exe"';
+  w.require('child_process').execSync(exe + ' "infobox" "www.baidu.com" "标题"');
+  assert.strictEqual(toasts.length, 1);
+  assert.strictEqual(toasts[0], 'www.baidu.com 标题', '以 .com 结尾的正文必须完整保留');
+  toasts.length = 0;
+  w.require('child_process').execSync(exe + ' "infobox" "点击 setup.exe" "安装"');
+  assert.strictEqual(toasts[0], '点击 setup.exe 安装', '正文里的 .exe 只是文字，不是被启动的文件');
 });
 
 test('消息正文里出现 shutdown 时仍只弹提示，绝不退出应用（Fix 2）', () => {
