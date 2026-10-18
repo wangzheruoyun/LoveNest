@@ -1034,10 +1034,38 @@
     return out;
   }
 
-  /** True for the flags of a nircmd/MessageShow box that are not user text. */
+  /**
+   * Every token of a command line, quotes stripped: `"a b" c` → `['a b', 'c']`.
+   *
+   * Quoting survives as one token, so a *whole argument* can be compared —
+   * unlike `lower.indexOf(...)`, which also matches inside a message body.
+   */
+  function commandTokens(text) {
+    var out = [];
+    var re = /"([^"]*)"|(\S+)/g;
+    var m;
+    while ((m = re.exec(text)) !== null) {
+      out.push(m[1] !== undefined ? m[1] : m[2]);
+    }
+    return out;
+  }
+
+  /**
+   * True for the parts of a popup command that are not user-visible text: the
+   * option keywords, the numeric flags, and the *executable / asset paths*.
+   *
+   * The paths matter. The engine builds every popup through
+   * `getNirCmdPath()` / `getTrayballoonPath()`, which wrap the exe in quotes
+   * (`"\"" + path + "\""`), and trayballoon additionally passes the icon as a
+   * game path. So the first quoted token of a real popup command is always an
+   * absolute filesystem path, and the icon argument is another one; both must
+   * be dropped or the toast shows internal paths instead of the gag text.
+   */
   function isPopupFlag(part) {
     return part === '' || part === 'infobox' || part === 'qboxcom' ||
-      part.indexOf('MB_') === 0 || /^[0-9]+$/.test(part);
+      part.indexOf('MB_') === 0 || /^[0-9]+$/.test(part) ||
+      /\.(exe|scr|com|bat|cmd)$/i.test(part) ||
+      part.indexOf('/') !== -1 || part.indexOf('\\') !== -1;
   }
 
   /** Human-readable notification text from a Windows popup command. */
@@ -1048,6 +1076,38 @@
       if (!isPopupFlag(part)) kept.push(part);
     }
     return kept.join(' ');
+  }
+
+  /** True when a command is one of the engine's popups (tray balloon / box). */
+  function isPopupCommand(lower, tokens) {
+    if (lower.indexOf('trayballoon') !== -1) return true;
+    if (lower.indexOf('nircmd') === -1) return false;
+    for (var i = 0; i < tokens.length; i++) {
+      var t = tokens[i].toLowerCase();
+      if (t === 'infobox' || t === 'qboxcom') return true;
+    }
+    return false;
+  }
+
+  /**
+   * True when a whole token is an OS power verb.
+   *
+   * Matching a *token* (not the raw command) is deliberate: the engine sends
+   * `nircmd.exe hibernate` and `nircmd.exe "shutdown"`, so the verb can be bare
+   * or quoted, but a message body that merely contains the word "shutdown"
+   * must never be mistaken for one — quitting the app mid-performance is far
+   * worse than a bad toast.
+   */
+  function isPowerVerb(token) {
+    return /^(shutdown|hibernate|exitwin|poweroff)$/i.test(token);
+  }
+
+  /** True when any argument of a command is a power verb. */
+  function hasPowerVerb(tokens) {
+    for (var i = 0; i < tokens.length; i++) {
+      if (isPowerVerb(tokens[i])) return true;
+    }
+    return false;
   }
 
   /**
@@ -1074,6 +1134,7 @@
   function runCommand(command) {
     var text = String(command == null ? '' : command);
     var lower = text.toLowerCase();
+    var tokens = commandTokens(text);
 
     // "read the player's real account name" — the first Meta performance.
     // `W26_WindowsFullName.fullName` takes line 2 of the output, so the shape
@@ -1082,9 +1143,12 @@
       return 'FullName\n\n' + asciiOnly(hostString('deviceName'));
     }
 
-    // "read the Windows version" — also GBK-decoded, so ASCII only.
+    // "read the Windows version" — also GBK-decoded, so ASCII only. The value
+    // must sit on line index 2: `W26_TraceConsole.handleInfo` starts reading at
+    // `split("\n")[2]` and skips blank lines, a plain one-line reply would be
+    // discarded.
     if (lower.indexOf('wmic os get caption') !== -1) {
-      return 'Android ' + asciiOnly(hostString('androidVersion'));
+      return '\n\nAndroid ' + asciiOnly(hostString('androidVersion'));
     }
 
     // `net user %username%` is the second "real name" performance
@@ -1102,20 +1166,21 @@
       return '';
     }
 
-    // "shut down the computer": the full game runs `nircmd.exe shutdown`, this
-    // Demo build's power-off command is `nircmd.exe hibernate` (customCommand_15033).
-    // Either way Android plays the black-screen performance and quits the app —
-    // it never really powers the device off.
-    if (lower.indexOf('nircmd') !== -1 && /shutdown|hibernate|exitwin|poweroff/.test(lower)) {
-      hostCall('fakeShutdown');
+    // "pop a tray balloon", and the nircmd message boxes: a toast/notification.
+    // Checked *before* the power verbs on purpose: a box whose body happens to
+    // contain "shutdown" is still a box, and only the popup text is quoted.
+    if (isPopupCommand(lower, tokens)) {
+      hostCall('toast', popupMessage(quotedArgs(text)));
       return '';
     }
 
-    // "pop a tray balloon", and the nircmd message boxes: a toast/notification.
-    if (lower.indexOf('trayballoon') !== -1 ||
-      (lower.indexOf('nircmd') !== -1 &&
-        (lower.indexOf('"infobox"') !== -1 || lower.indexOf('"qboxcom"') !== -1))) {
-      hostCall('toast', popupMessage(quotedArgs(text)));
+    // "shut down the computer": the full game runs `nircmd.exe shutdown`, this
+    // Demo build's power-off command is `nircmd.exe hibernate` (customCommand_15033).
+    // Either way Android plays the black-screen performance and quits the app —
+    // it never really powers the device off. The verb is matched as a token, so
+    // the word inside some other argument cannot trigger it.
+    if (lower.indexOf('nircmd') !== -1 && hasPowerVerb(tokens)) {
+      hostCall('fakeShutdown');
       return '';
     }
 

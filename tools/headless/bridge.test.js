@@ -384,6 +384,16 @@ test('nw.gui 提供 Window.get / Clipboard.get / Shell.openItem', () => {
 
 /* ---- Task 4 extra coverage ---- */
 
+test('wmic os get Caption 的第三行是版本值，可被 W26_TraceConsole.handleInfo 采用', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.androidVersion = () => '14';
+  const w = loadBridge(host);
+  const s = String(w.require('child_process').execSync('chcp 936 && wmic os get Caption'));
+  assert.ok(/^[\x00-\x7F]*$/.test(s), '输出必须全为 ASCII');
+  // 引擎 W26_TraceConsole.handleInfo 从下标 2 开始并跳过空行，因此值必须落在第 3 行。
+  assert.strictEqual(s.split('\n')[2], 'Android 14');
+});
+
 test('设备名非 ASCII 时 GBK 缓冲路径仍返回纯 ASCII（Review Focus #4）', () => {
   const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
   host.deviceName = () => '张三的 OnePlus 12';
@@ -429,6 +439,7 @@ test('reg add ... /v Wallpaper 读取游戏内图片并以 base64 交给宿主 s
   let wall = null;
   const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
   host.setWallpaper = (b64) => { wall = b64; return true; };
+  host.log = () => {}; // 刷新的 rundll32 未映射，吞掉宿主日志噪声
   const w = loadBridge(host);
   const img = GAME_ROOT + '/asset/pcSys/nircmd.exe'; // 任何真实文件均可，MZ 头便于断言
   w.require('child_process').execSync(
@@ -443,15 +454,66 @@ test('reg add ... /v Wallpaper 读取游戏内图片并以 base64 交给宿主 s
   assert.strictEqual(wall, null);
 });
 
-test('trayballoon 命令转为宿主 toast，并把消息正文带给用户', () => {
+test('trayballoon 真实命令形态（exe 路径带引号）只把正文交给 toast，不泄漏内部路径', () => {
   const toasts = [];
   const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
   host.toast = (m) => { toasts.push(String(m)); };
   const w = loadBridge(host);
+  // 引擎 getTrayballoonPath() 返回 "\"<绝对路径>\""，所以真实命令的首个引号段
+  // 就是可执行文件路径（rv.js showTrayballoon），随后才是正文与图标路径。
+  const exe = '"' + GAME_ROOT + '/asset/pcSys/trayballoon.exe"';
+  const icon = GAME_ROOT + '/asset/pcSys/icon.png';
   w.require('child_process').execSync(
-    GAME_ROOT + '/asset/pcSys/trayballoon.exe "标题" "不要再看了" "5000" "0" "1" ');
+    exe + ' "标题" "不要再看了" "5000" "0" "' + icon + '" ');
   assert.strictEqual(toasts.length, 1);
+  assert.strictEqual(toasts[0], '标题 不要再看了', '只应保留真正面向用户的文本');
   assert.ok(toasts[0].indexOf('不要再看了') >= 0, '气泡正文必须传给 toast');
+  assert.ok(toasts[0].indexOf('trayballoon.exe') < 0, 'exe 路径不得泄漏到提示里');
+  assert.ok(toasts[0].indexOf(GAME_ROOT) < 0, '内部路径不得泄漏到提示里');
+});
+
+test('nircmd infobox 真实命令形态不把 exe 路径当作提示正文', () => {
+  const toasts = [];
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.toast = (m) => { toasts.push(String(m)); };
+  const w = loadBridge(host);
+  const exe = '"' + GAME_ROOT + '/asset/pcSys/nircmd.exe"';
+  // 引擎：getNirCmdPath() + ' "infobox" "<content>" "<title>"'
+  w.require('child_process').exec(exe + ' "infobox" "正文内容" "标题"');
+  assert.strictEqual(toasts.length, 1);
+  assert.ok(toasts[0].indexOf('正文内容') >= 0, '正文必须传给 toast');
+  assert.ok(toasts[0].indexOf('nircmd.exe') < 0, 'exe 路径不得泄漏');
+  assert.ok(toasts[0].indexOf(GAME_ROOT) < 0, '内部路径不得泄漏');
+});
+
+test('nircmd qboxcom 真实命令形态不泄漏路径，也不退出应用', () => {
+  let shut = 0;
+  const toasts = [];
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.fakeShutdown = () => { shut++; };
+  host.toast = (m) => { toasts.push(String(m)); };
+  const w = loadBridge(host);
+  const exe = '"' + GAME_ROOT + '/asset/pcSys/nircmd.exe"';
+  // 引擎：... + ' "qboxcom" "<content>" "<title>" consolewrite yes'
+  w.require('child_process').exec(exe + ' "qboxcom" "要退出吗" "确认" consolewrite yes');
+  assert.strictEqual(toasts.length, 1);
+  assert.ok(toasts[0].indexOf('要退出吗') >= 0, '正文必须传给 toast');
+  assert.ok(toasts[0].indexOf(GAME_ROOT) < 0, '内部路径不得泄漏');
+  assert.strictEqual(shut, 0, 'qboxcom 不是关机命令');
+});
+
+test('消息正文里出现 shutdown 时仍只弹提示，绝不退出应用（Fix 2）', () => {
+  let shut = 0;
+  const toasts = [];
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.fakeShutdown = () => { shut++; };
+  host.toast = (m) => { toasts.push(String(m)); };
+  const w = loadBridge(host);
+  const exe = '"' + GAME_ROOT + '/asset/pcSys/nircmd.exe"';
+  w.require('child_process').execSync(exe + ' "infobox" "shutdown" "系统提示"');
+  assert.strictEqual(shut, 0, '正文里的 shutdown 不得导致应用退出');
+  assert.strictEqual(toasts.length, 1, '必须仍然弹提示');
+  assert.ok(toasts[0].indexOf('shutdown') >= 0);
 });
 
 test('未映射的 Windows 命令写宿主日志并返回空串；exec 的 stdout 通过回调异步送达', async () => {
@@ -485,7 +547,7 @@ test('exec 回调签名与 Node 一致：(error, stdout, stderr)，且不阻塞�
     assert.strictEqual(ret, undefined, 'exec 必须立即返回 undefined');
   });
   assert.strictEqual(seen.err, null);
-  assert.strictEqual(Buffer.from(seen.out).toString('latin1'), 'Android 14');
+  assert.strictEqual(Buffer.from(seen.out).toString('latin1'), '\n\nAndroid 14');
   assert.strictEqual(seen.stderr, '');
 });
 
@@ -498,7 +560,7 @@ test('process.exec / process.execSync 转发到同一个命令路由器（Task 2
   // 修复前的 no-op 代理会让这两条断言静默通过/失败，故必须真正驱动副作用
   w.process.exec(GAME_ROOT + '/asset/pcSys/nircmd.exe "shutdown"');
   assert.strictEqual(shut, 1, 'process.exec 必须到达命令路由器');
-  assert.strictEqual(w.process.execSync('chcp 936 && wmic os get Caption'), 'Android 14');
+  assert.strictEqual(w.process.execSync('chcp 936 && wmic os get Caption'), '\n\nAndroid 14');
 });
 
 test('spawn 返回带 on("close") 的子进程对象并把弹窗映射为 toast', async () => {
