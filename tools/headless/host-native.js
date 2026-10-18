@@ -138,6 +138,29 @@ function createHost(options) {
       }
     },
 
+    rename: function (p, toPath) {
+      const from = toRealPath(p);
+      const to = toRealPath(toPath);
+      if (from === null || to === null) return false;
+      try {
+        fs.renameSync(from, to);
+        return true;
+      } catch (e) {
+        return false;
+      }
+    },
+
+    rmdir: function (p) {
+      const abs = toRealPath(p);
+      if (abs === null) return false;
+      try {
+        fs.rmdirSync(abs);
+        return true;
+      } catch (e) {
+        return false;
+      }
+    },
+
     deviceName: function () {
       return 'Headless Host';
     },

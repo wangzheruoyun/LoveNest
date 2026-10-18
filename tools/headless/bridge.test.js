@@ -704,74 +704,103 @@ test('fs.copyFileSync 逐字节复制源文件并落到目标（经宿主 writeB
     (err) => err && err.code === 'ENOENT');
 });
 
-test('fs.renameSync 经宿主 rename 完成重命名（不再静默 no-op）', () => {
-  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
-  const calls = [];
-  host.rename = (from, to) => { calls.push([String(from), String(to)]); return true; };
-  const w = loadBridge(host);
-  const fsShim = w.require('fs');
-  assert.doesNotThrow(() => fsShim.renameSync(GAME_ROOT + '/index.html', '/tmp/d/index.html'));
-  assert.deepStrictEqual(calls, [[GAME_ROOT + '/index.html', '/tmp/d/index.html']],
-    '重命名必须真的下发到宿主，否则设备上存档轮换会静默丢失');
+test('fs.renameSync 经真实宿主真的移动文件，移动后可读回', () => {
+  const docs = fs.mkdtempSync('/tmp/lovenest-rename-');
+  try {
+    const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: docs }));
+    const fsShim = w.require('fs');
+    const src = docs + '/save.gcdata';
+    const dst = docs + '/save.gcdata.bak';
+    fsShim.writeFileSync(src, '存档内容');
+    assert.strictEqual(fsShim.existsSync(src), true);
+
+    fsShim.renameSync(src, dst);
+
+    assert.strictEqual(fsShim.existsSync(src), false, '源文件必须真的消失');
+    assert.strictEqual(fsShim.existsSync(dst), true, '目标文件必须真的出现');
+    assert.strictEqual(fsShim.readFileSync(dst, 'utf8'), '存档内容');
+    // Cross-check against the real filesystem, not just the shim's own view.
+    assert.strictEqual(fs.existsSync(src), false);
+    assert.strictEqual(fs.readFileSync(dst, 'utf8'), '存档内容');
+  } finally {
+    fs.rmSync(docs, { recursive: true, force: true });
+  }
 });
 
 test('fs.renameSync 源缺失 → ENOENT，任一端越界 → EACCES', () => {
-  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
-  host.rename = () => false;
-  const w = loadBridge(host);
-  const fsShim = w.require('fs');
-  assert.throws(() => fsShim.renameSync(GAME_ROOT + '/__nope__', '/tmp/d/x'),
-    (err) => err && err.code === 'ENOENT');
-  assert.throws(() => fsShim.renameSync('/etc/passwd', '/tmp/d/x'),
-    (err) => err && err.code === 'EACCES');
-  assert.throws(() => fsShim.renameSync(GAME_ROOT + '/index.html', '/etc/passwd'),
-    (err) => err && err.code === 'EACCES');
+  const docs = fs.mkdtempSync('/tmp/lovenest-rename-err-');
+  try {
+    const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: docs }));
+    const fsShim = w.require('fs');
+    assert.throws(() => fsShim.renameSync(docs + '/__nope__', docs + '/x'),
+      (err) => err && err.code === 'ENOENT');
+    assert.throws(() => fsShim.renameSync('/etc/passwd', docs + '/x'),
+      (err) => err && err.code === 'EACCES');
+    assert.throws(() => fsShim.renameSync(docs + '/a', '/etc/passwd'),
+      (err) => err && err.code === 'EACCES');
+  } finally {
+    fs.rmSync(docs, { recursive: true, force: true });
+  }
 });
 
-test('fs.rmdirSync 经宿主 rmdir 删除目录（空目录成功）', () => {
-  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
-  const calls = [];
-  host.rmdir = (p) => { calls.push(String(p)); return true; };
-  const w = loadBridge(host);
-  const fsShim = w.require('fs');
-  assert.doesNotThrow(() => fsShim.rmdirSync(GAME_ROOT + '/asset'));
-  assert.deepStrictEqual(calls, [GAME_ROOT + '/asset']);
+test('fs.rmdirSync 经真实宿主删除真实空目录', () => {
+  const docs = fs.mkdtempSync('/tmp/lovenest-rmdir-');
+  try {
+    const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: docs }));
+    const fsShim = w.require('fs');
+    const dir = docs + '/empty-dir';
+    fsShim.mkdirSync(dir);
+    assert.strictEqual(fs.existsSync(dir), true);
+
+    fsShim.rmdirSync(dir);
+
+    assert.strictEqual(fs.existsSync(dir), false, '空目录必须真的被删除');
+    assert.strictEqual(fsShim.existsSync(dir), false);
+  } finally {
+    fs.rmSync(docs, { recursive: true, force: true });
+  }
 });
 
 test('fs.rmdirSync 非空目录 → ENOTEMPTY，文件 → ENOTDIR，缺失 → ENOENT，越界 → EACCES', () => {
-  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
-  host.rmdir = () => false;
-  const w = loadBridge(host);
-  const fsShim = w.require('fs');
-  assert.throws(() => fsShim.rmdirSync(GAME_ROOT + '/asset'),
-    (err) => err && err.code === 'ENOTEMPTY');
-  assert.throws(() => fsShim.rmdirSync(GAME_ROOT + '/index.html'),
-    (err) => err && err.code === 'ENOTDIR');
-  assert.throws(() => fsShim.rmdirSync(GAME_ROOT + '/__nope__'),
-    (err) => err && err.code === 'ENOENT');
-  assert.throws(() => fsShim.rmdirSync('/etc/passwd'),
-    (err) => err && err.code === 'EACCES');
+  const docs = fs.mkdtempSync('/tmp/lovenest-rmdir-err-');
+  try {
+    const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: docs }));
+    const fsShim = w.require('fs');
+    const full = docs + '/full';
+    fsShim.mkdirSync(full);
+    fsShim.writeFileSync(full + '/x.txt', 'x');
+    assert.throws(() => fsShim.rmdirSync(full),
+      (err) => err && err.code === 'ENOTEMPTY');
+    assert.throws(() => fsShim.rmdirSync(full + '/x.txt'),
+      (err) => err && err.code === 'ENOTDIR');
+    assert.throws(() => fsShim.rmdirSync(docs + '/__nope__'),
+      (err) => err && err.code === 'ENOENT');
+    assert.throws(() => fsShim.rmdirSync('/etc'),
+      (err) => err && err.code === 'EACCES');
+  } finally {
+    fs.rmSync(docs, { recursive: true, force: true });
+  }
 });
 
-test('fs.rename/fs.rmdir 异步形式复用同步实现并把错误交给回调', async () => {
-  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
-  const seen = [];
-  host.rename = (from, to) => { seen.push('rename ' + from + ' -> ' + to); return true; };
-  host.rmdir = (p) => { seen.push('rmdir ' + p); return false; };
-  const w = loadBridge(host);
-  const fsShim = w.require('fs');
-  const renameErr = await new Promise((resolve) => {
-    fsShim.rename(GAME_ROOT + '/index.html', '/tmp/d/a', (err) => resolve(err));
-  });
-  const rmdirErr = await new Promise((resolve) => {
-    fsShim.rmdir(GAME_ROOT + '/__nope__', (err) => resolve(err));
-  });
-  assert.strictEqual(renameErr, null);
-  assert.ok(rmdirErr && rmdirErr.code === 'ENOENT');
-  assert.deepStrictEqual(seen, [
-    'rename ' + GAME_ROOT + '/index.html -> /tmp/d/a',
-    'rmdir ' + GAME_ROOT + '/__nope__'
-  ]);
+test('fs.rename/fs.rmdir 异步形式经真实宿主生效，错误交给回调', async () => {
+  const docs = fs.mkdtempSync('/tmp/lovenest-async-');
+  try {
+    const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: docs }));
+    const fsShim = w.require('fs');
+    const src = docs + '/a.txt';
+    const dst = docs + '/b.txt';
+    fsShim.writeFileSync(src, 'hi');
+
+    const renameErr = await new Promise((resolve) => fsShim.rename(src, dst, resolve));
+    assert.strictEqual(renameErr, null);
+    assert.strictEqual(fs.existsSync(src), false);
+    assert.strictEqual(fs.readFileSync(dst, 'utf8'), 'hi');
+
+    const rmdirErr = await new Promise((resolve) => fsShim.rmdir(docs + '/__nope__', resolve));
+    assert.ok(rmdirErr && rmdirErr.code === 'ENOENT');
+  } finally {
+    fs.rmSync(docs, { recursive: true, force: true });
+  }
 });
 
 test('fs.createWriteStream 异步触发 finish 再 close（否则等待的 SyncTask 永挂起）', async () => {

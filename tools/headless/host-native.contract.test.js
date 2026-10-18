@@ -19,7 +19,8 @@ const { createHost } = require('./host-native');
 const GAME_ROOT = '/storage/emulated/0/Download/爱之巢DemoV1.52';
 const DOCS_ROOT = '/tmp/lovenest-contract-' + process.pid;
 
-// The full `__GCNative` method list from the plan's Task 3 Interfaces.
+// The full `__GCNative` method list from the plan's Task 3 Interfaces, extended
+// by Task 5 fix round 2 with `rename`/`rmdir` (21 methods).
 const METHOD_NAMES = [
   'gameRoot',
   'docsRoot',
@@ -30,6 +31,8 @@ const METHOD_NAMES = [
   'readDir',
   'mkdirp',
   'unlink',
+  'rename',
+  'rmdir',
   'deviceName',
   'androidVersion',
   'setWallpaper',
@@ -88,7 +91,7 @@ const ESCAPING_PATHS = [
   '../escape.txt',
 ];
 
-test('实现 Task 3 Interfaces 的全部 19 个方法，不多不少', () => {
+test('实现 Task 3 Interfaces 的全部 21 个方法，不多不少', () => {
   assert.deepStrictEqual(Object.keys(host).sort(), [...METHOD_NAMES].sort());
   for (const name of METHOD_NAMES) {
     assert.strictEqual(typeof host[name], 'function', name + ' 必须是函数');
@@ -171,6 +174,28 @@ test('mkdirp() 与 unlink() 工作，且 unlink 拒绝目录', () => {
   assert.strictEqual(host.unlink(file), false, '删除不存在的文件返回 false');
 });
 
+test('rename() 与 rmdir() 工作，后者拒绝非空目录与文件', () => {
+  const dir = DOCS_ROOT + '/mut';
+  assert.strictEqual(host.mkdirp(dir), true);
+  const src = dir + '/a.txt';
+  const dst = dir + '/b.txt';
+  assert.strictEqual(host.writeBase64(src, Buffer.from('move me').toString('base64')), true);
+
+  assert.strictEqual(host.rename(src, dst), true);
+  assert.strictEqual(host.exists(src), false);
+  assert.strictEqual(Buffer.from(host.readBase64(dst), 'base64').toString('utf8'), 'move me');
+  assert.strictEqual(host.rename(src, dst), false, '重命名不存在的文件返回 false');
+
+  // rmdir only removes empty directories.
+  const empty = dir + '/empty';
+  assert.strictEqual(host.mkdirp(empty), true);
+  assert.strictEqual(host.rmdir(empty), true);
+  assert.strictEqual(host.exists(empty), false);
+  assert.strictEqual(host.rmdir(dir), false, '非空目录不得删除');
+  assert.strictEqual(host.rmdir(dst), false, '文件不是目录');
+  assert.strictEqual(host.rmdir(dir + '/__nope__'), false, '不存在的目录返回 false');
+});
+
 test('逃逸出 gameRoot/docsRoot 的路径一律被拒绝', () => {
   for (const p of ESCAPING_PATHS) {
     assert.strictEqual(host.exists(p), false, 'exists ' + p);
@@ -179,6 +204,8 @@ test('逃逸出 gameRoot/docsRoot 的路径一律被拒绝', () => {
     assert.strictEqual(host.readDir(p), '[]', 'readDir ' + p);
     assert.strictEqual(host.mkdirp(p), false, 'mkdirp ' + p);
     assert.strictEqual(host.unlink(p), false, 'unlink ' + p);
+    assert.strictEqual(host.rename(p, DOCS_ROOT + '/x'), false, 'rename src ' + p);
+    assert.strictEqual(host.rmdir(p), false, 'rmdir ' + p);
     assert.strictEqual(host.writeBase64(p, 'aGk='), false, 'writeBase64 ' + p);
   }
   assert.strictEqual(fs.existsSync('/tmp/escape.txt'), false, '不得真的写出逃逸文件');
@@ -192,6 +219,8 @@ test('空路径与不存在的路径返回 null/false/[]，从不抛异常', () 
     assert.strictEqual(host.readDir(p), '[]');
     assert.strictEqual(host.mkdirp(p), false);
     assert.strictEqual(host.unlink(p), false);
+    assert.strictEqual(host.rename(p, DOCS_ROOT + '/x'), false);
+    assert.strictEqual(host.rmdir(p), false);
     assert.strictEqual(host.writeBase64(p, 'aGk='), false);
   }
 
