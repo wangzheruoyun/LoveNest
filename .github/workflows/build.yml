@@ -38,6 +38,13 @@ jobs:
         working-directory: android-app
         run: gradle assembleDebug --stacktrace
 
+      # The plan's Task 7 Steps 2/5/7 use CI as the only test runner: there is no
+      # Java or Android SDK on the development machine, and the game folder is
+      # not needed for unit tests.
+      - name: Run unit tests
+        working-directory: android-app
+        run: gradle :app:testDebugUnitTest --stacktrace
+
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:

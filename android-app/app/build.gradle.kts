@@ -30,3 +30,9 @@ android {
         jvmTarget = "17"
     }
 }
+
+dependencies {
+    // The only dependency in this module. Path mapping / base64 unit tests are
+    // pure JVM code, so plain JUnit 4 keeps the app itself dependency-free.
+    testImplementation("junit:junit:4.13.2")
+}
