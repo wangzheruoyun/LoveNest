@@ -1,0 +1,11 @@
+# Node dependencies
+node_modules/
+
+# Headless harness scratch output (screenshot.png / console.log)
+tools/headless/out/
+
+# Signing material must never be committed (see plan Task 8)
+*.jks
+
+# OS noise
+.DS_Store

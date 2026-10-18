@@ -1,0 +1,5 @@
+# Installed dependencies (restored with `npm install`)
+node_modules/
+
+# Scratch run output: screenshot.png / console.log
+out/

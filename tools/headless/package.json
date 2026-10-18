@@ -1,0 +1,15 @@
+{
+  "name": "lovenest-headless",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless harness: boots the real Love Nest game in Chromium so the gc-bridge shim can be developed and verified in seconds instead of waiting on an Android CI round trip.",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test",
+    "run": "node run.js"
+  },
+  "license": "ISC",
+  "devDependencies": {
+    "playwright": "^1.64.1"
+  }
+}
