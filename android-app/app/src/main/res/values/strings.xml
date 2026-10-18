@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Task 10 switches the launcher label to 爱之巢. -->
+    <string name="app_name">Love Nest</string>
+</resources>

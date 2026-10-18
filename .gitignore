@@ -4,8 +4,14 @@ node_modules/
 # Headless harness scratch output (screenshot.png / console.log)
 tools/headless/out/
 
+# Android / Gradle build output
+build/
+.gradle/
+local.properties
+
 # Signing material must never be committed (see plan Task 8)
 *.jks
+*.keystore
 
 # OS noise
 .DS_Store

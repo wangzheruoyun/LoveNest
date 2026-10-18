@@ -1,0 +1,46 @@
+name: Android CI
+
+# Task 8 will add the tag trigger that produces signed release APKs and GitHub
+# Releases. This task only needs the debug APK to prove the shell compiles and
+# ships on CI.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # There is deliberately no Gradle wrapper in this repo (see task Ruling A):
+      # we have no local Java/Gradle to generate one and refuse to commit an
+      # unverifiable binary jar. setup-gradle installs the pinned distribution
+      # and puts `gradle` on PATH instead.
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build debug APK
+        working-directory: android-app
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: android-app/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
