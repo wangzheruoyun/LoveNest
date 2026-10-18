@@ -457,6 +457,9 @@
    * `require` with a lazy no-op fallback
    * ------------------------------------------------------------------ */
 
+  // `Symbol` is an ES6 built-in; guard it so the ES5 syntax rule is respected.
+  var symbolToPrimitive = (typeof Symbol !== 'undefined' && Symbol.toPrimitive) ? Symbol.toPrimitive : null;
+
   /**
    * A lazy no-op stand-in for a module the shim does not provide. Every
    * property is another callable no-op, and calling or `new`-ing a no-op
@@ -479,6 +482,19 @@
     return new Proxy(noop, {
       get: function (target, prop) {
         if (prop === 'then') return undefined;
+        // Primitive coercion hooks must yield a *primitive*, otherwise
+        // `String(mod)` / `'' + mod` / `mod == x` throw "Cannot convert object
+        // to primitive value" — a TypeError on a path that used to degrade.
+        if (symbolToPrimitive !== null && prop === symbolToPrimitive) {
+          return function () {
+            return '';
+          };
+        }
+        if (prop === 'toString' || prop === 'valueOf') {
+          return function () {
+            return '';
+          };
+        }
         if (typeof prop === 'symbol') return undefined;
         return child(target);
       },
@@ -520,9 +536,18 @@
     win.require = requireModule;
     win.process = processObject;
     // Stable introspection hook for the headless harness (and on-device
-    // debugging). Double-underscore namespaced so it cannot collide with an
-    // engine global; Ruling 1's no-escape-check behaviour of resolvePath is
-    // pinned by a test through this hook.
-    win.__gcBridge = { resolvePath: resolvePath, toBuffer: toBuffer };
+    // debugging). Non-enumerable so an engine-wide `for...in window` /
+    // `Object.keys(window)` scan never sees it, and non-writable so the engine
+    // cannot clobber it. Guarded so a re-injection of the bridge into the same
+    // window does not redefine it. Ruling 1's no-escape-check behaviour of
+    // resolvePath is pinned by a test through this hook.
+    if (!Object.prototype.hasOwnProperty.call(win, '__gcBridge')) {
+      Object.defineProperty(win, '__gcBridge', {
+        value: { resolvePath: resolvePath, toBuffer: toBuffer },
+        enumerable: false,
+        writable: false,
+        configurable: false
+      });
+    }
   }
 })();

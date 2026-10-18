@@ -66,6 +66,34 @@ test('未知模块的 no-op 代理可安全链式调用与 new', () => {
   assert.strictEqual(typeof mod.a.b.c(), 'function', '调用链末端调用仍返回 no-op，绝不抛异常');
 });
 
+test('未知模块的 no-op 代理参与原始值强制转换时不抛异常', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const mod = w.require('some-unknown-module');
+  // String() / 模板拼接 / 宽松相等三条强制转换路径都必须产出原始值。
+  assert.strictEqual(String(mod), '');
+  assert.strictEqual('' + mod, '');
+  assert.doesNotThrow(() => { void (mod == 1); });
+  assert.strictEqual(mod == 1, false);
+  assert.doesNotThrow(() => { void (mod < 1); });
+  // 强制转换特例不得破坏调用/new/链式访问的形状。
+  assert.strictEqual(typeof mod.a()(), 'function');
+  assert.strictEqual(typeof new mod.X(), 'function');
+  assert.strictEqual(typeof mod.a.b.c(), 'function');
+});
+
+test('window.__gcBridge 不可枚举且不可写', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  assert.strictEqual(Object.keys(w).indexOf('__gcBridge'), -1, '不得出现在 Object.keys 中');
+  const desc = Object.getOwnPropertyDescriptor(w, '__gcBridge');
+  assert.ok(desc, '__gcBridge 必须已定义');
+  assert.strictEqual(desc.enumerable, false);
+  assert.strictEqual(desc.writable, false);
+  const before = w.__gcBridge;
+  w.__gcBridge = 1; // 宽松模式下静默失败，不得覆盖
+  assert.strictEqual(w.__gcBridge, before);
+  assert.strictEqual(typeof w.__gcBridge.resolvePath, 'function');
+});
+
 test('resolvePath() 仅做词法拼接，不对爬升路径做逃逸拒绝（Ruling 1）', () => {
   const w = loadBridge(createHost({ gameRoot: '/srv/game', docsRoot: '/tmp/d' }));
   const rp = w.__gcBridge.resolvePath;
