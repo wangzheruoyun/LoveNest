@@ -454,6 +454,510 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * Encoding helpers (used by the `fs` shim)
+   *
+   * No `TextEncoder` / `TextDecoder` / `Buffer`: those may be absent in the
+   * WebView, and Node 0.64-era engine code passes `'utf8'` and expects the
+   * same bytes. The conversions are done by hand so the bridge behaves
+   * identically in Chromium and in the `node:vm` harness.
+   * ------------------------------------------------------------------ */
+
+  /** Base64-encode a `Uint8Array` (or plain byte array). */
+  function toBase64(bytes) {
+    var s = '';
+    var i;
+    for (i = 0; i + 2 < bytes.length; i += 3) {
+      var n3 = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+      s += B64_ALPHABET.charAt((n3 >> 18) & 63) +
+        B64_ALPHABET.charAt((n3 >> 12) & 63) +
+        B64_ALPHABET.charAt((n3 >> 6) & 63) +
+        B64_ALPHABET.charAt(n3 & 63);
+    }
+    var rem = bytes.length - i;
+    if (rem === 1) {
+      var n1 = bytes[i] << 16;
+      s += B64_ALPHABET.charAt((n1 >> 18) & 63) +
+        B64_ALPHABET.charAt((n1 >> 12) & 63) + '==';
+    } else if (rem === 2) {
+      var n2 = (bytes[i] << 16) | (bytes[i + 1] << 8);
+      s += B64_ALPHABET.charAt((n2 >> 18) & 63) +
+        B64_ALPHABET.charAt((n2 >> 12) & 63) +
+        B64_ALPHABET.charAt((n2 >> 6) & 63) + '=';
+    }
+    return s;
+  }
+
+  /** UTF-8 encode a string to a `Uint8Array` (lone surrogates become U+FFFD). */
+  function utf8Encode(str) {
+    var s = String(str == null ? '' : str);
+    var bytes = [];
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c < 0x80) {
+        bytes.push(c);
+      } else if (c < 0x800) {
+        bytes.push(0xC0 | (c >> 6), 0x80 | (c & 0x3F));
+      } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
+        var d = s.charCodeAt(i + 1);
+        if (d >= 0xDC00 && d <= 0xDFFF) {
+          i++;
+          var cp = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+          bytes.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F),
+            0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+        } else {
+          bytes.push(0xEF, 0xBF, 0xBD);
+        }
+      } else if (c >= 0xD800 && c <= 0xDFFF) {
+        bytes.push(0xEF, 0xBF, 0xBD);
+      } else {
+        bytes.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
+      }
+    }
+    var out = new Uint8Array(bytes.length);
+    for (var j = 0; j < bytes.length; j++) out[j] = bytes[j];
+    return out;
+  }
+
+  /** UTF-8 decode a `Uint8Array`; malformed sequences become U+FFFD. */
+  function utf8Decode(bytes) {
+    var out = '';
+    var CHUNK = 8192;
+    var chunk = [];
+    function flush() {
+      if (chunk.length > 0) {
+        out += String.fromCharCode.apply(null, chunk);
+        chunk.length = 0;
+      }
+    }
+    var i = 0;
+    var n = bytes.length;
+    while (i < n) {
+      var c = bytes[i++];
+      if (c < 0x80) {
+        chunk.push(c);
+      } else if (c < 0xC0) {
+        chunk.push(0xFFFD); // stray continuation byte
+      } else if (c < 0xE0) {
+        var c2 = bytes[i];
+        if (c2 === undefined || (c2 & 0xC0) !== 0x80) {
+          chunk.push(0xFFFD);
+        } else {
+          i++;
+          chunk.push(((c & 0x1F) << 6) | (c2 & 0x3F));
+        }
+      } else if (c < 0xF0) {
+        var c3 = bytes[i];
+        var c4 = bytes[i + 1];
+        if (c3 === undefined || (c3 & 0xC0) !== 0x80 ||
+          c4 === undefined || (c4 & 0xC0) !== 0x80) {
+          chunk.push(0xFFFD);
+        } else {
+          i += 2;
+          chunk.push(((c & 0x0F) << 12) | ((c3 & 0x3F) << 6) | (c4 & 0x3F));
+        }
+      } else {
+        var b2 = bytes[i];
+        var b3 = bytes[i + 1];
+        var b4 = bytes[i + 2];
+        if (b2 === undefined || (b2 & 0xC0) !== 0x80 ||
+          b3 === undefined || (b3 & 0xC0) !== 0x80 ||
+          b4 === undefined || (b4 & 0xC0) !== 0x80) {
+          chunk.push(0xFFFD);
+        } else {
+          i += 3;
+          var point = ((c & 0x07) << 18) | ((b2 & 0x3F) << 12) |
+            ((b3 & 0x3F) << 6) | (b4 & 0x3F);
+          point -= 0x10000;
+          chunk.push(0xD800 + (point >> 10), 0xDC00 + (point & 0x3FF));
+        }
+      }
+      if (chunk.length >= CHUNK) flush();
+    }
+    flush();
+    return out;
+  }
+
+  function latin1Encode(str) {
+    var s = String(str == null ? '' : str);
+    var out = new Uint8Array(s.length);
+    for (var i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
+    return out;
+  }
+
+  function latin1Decode(bytes) {
+    var CHUNK = 8192;
+    var out = '';
+    for (var i = 0; i < bytes.length; i += CHUNK) {
+      out += String.fromCharCode.apply(null, Array.prototype.slice.call(bytes, i, i + CHUNK));
+    }
+    return out;
+  }
+
+  function asciiEncode(str) {
+    var s = String(str == null ? '' : str);
+    var out = new Uint8Array(s.length);
+    for (var i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0x7f;
+    return out;
+  }
+
+  function asciiDecode(bytes) {
+    var CHUNK = 8192;
+    var out = '';
+    for (var i = 0; i < bytes.length; i += CHUNK) {
+      out += String.fromCharCode.apply(null, Array.prototype.slice.call(bytes, i, i + CHUNK));
+    }
+    return out;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * `fs` shim — synchronous IO backed by the native host
+   *
+   * Error semantics (plan Ruling 6, Review Focus #1/#2). The native host
+   * never throws: it reports failure as `null` / `false` / `'[]'`. The
+   * engine, however, is Node-authored code written against Node semantics,
+   * so this layer *translates* those sentinels into Node-faithful errors
+   * with a `code` property (`ENOENT`, `EACCES`, `ENOTDIR`, `EISDIR`,
+   * `EEXIST`). Silently handing back `null` where Node returns a `Buffer`
+   * would surface downstream as a confusing `TypeError` inside the engine
+   * instead of the `ENOENT`/`EACCES` the engine already knows how to catch
+   * and report. `existsSync` is the one exception: Node's contract is
+   * "never throws", so it returns `false` for every failure.
+   *
+   * The host remains the single authority for path resolution and escape
+   * rejection (plan Ruling 1): every access still goes through the host,
+   * which returns its failure sentinel for an escaping path. The roots are
+   * consulted *only* to pick the error code, using the same lexical rule the
+   * host itself applies to an already-normalised path — this layer never
+   * allows an access the host refuses.
+   * ------------------------------------------------------------------ */
+
+  // Linux errno values, matching what Node reports on Android.
+  var FS_ERRNO = {
+    ENOENT: -2,
+    EACCES: -13,
+    EEXIST: -17,
+    ENOTDIR: -20,
+    EISDIR: -21
+  };
+
+  var FS_STRERROR = {
+    ENOENT: 'no such file or directory',
+    EACCES: 'permission denied',
+    EEXIST: 'file already exists',
+    ENOTDIR: 'not a directory',
+    EISDIR: 'illegal operation on a directory'
+  };
+
+  /** Build a Node-shaped `Error` carrying `code` / `errno` / `syscall` / `path`. */
+  function fsError(code, syscall, p) {
+    var msg = (FS_STRERROR[code] || 'unknown error');
+    var err = new Error(code + ': ' + msg + ', ' + syscall + " '" + p + "'");
+    err.errno = FS_ERRNO[code];
+    err.code = code;
+    err.syscall = syscall;
+    err.path = p;
+    return err;
+  }
+
+  /** Call a host method, absorbing any host-side throw into `undefined`. */
+  function hostCall(name, arg1, arg2) {
+    if (!host || typeof host[name] !== 'function') return undefined;
+    try {
+      return (arg2 === undefined) ? host[name](arg1) : host[name](arg1, arg2);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function isInsideRoot(abs, root) {
+    if (!root || root === '/') return true;
+    return abs === root || abs.indexOf(root + '/') === 0;
+  }
+
+  /** True when the resolved path is one the host is willing to touch. */
+  function isWithinRoots(abs) {
+    return isInsideRoot(abs, gameRoot()) || isInsideRoot(abs, docsRoot());
+  }
+
+  /** Parse `host.stat()` JSON text into `{isDirectory, size}` or `null`. */
+  function parseStat(text) {
+    if (typeof text !== 'string') return null;
+    try {
+      var info = JSON.parse(text);
+      return (info && typeof info === 'object') ? info : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * Node error for a failed read of `abs`: `EACCES` when the path escapes
+   * both roots, `ENOENT` when it is simply absent, `fallback` otherwise.
+   */
+  function lookupFailure(abs, syscall, fallback) {
+    if (!isWithinRoots(abs)) return fsError('EACCES', syscall, abs);
+    if (hostCall('exists', abs) !== true) return fsError('ENOENT', syscall, abs);
+    return fsError(fallback, syscall, abs);
+  }
+
+  /** Normalise the `options` argument of `readFile`/`writeFile` to a string. */
+  function parseEncoding(options) {
+    if (options === null || options === undefined) return null;
+    if (typeof options === 'string') return options;
+    if (typeof options === 'object' && typeof options.encoding === 'string') {
+      return options.encoding;
+    }
+    return null; // `{encoding: null}` / `{}` means "give me the bytes"
+  }
+
+  /** Map an encoding string onto one of the four this shim implements. */
+  function canonicalEncoding(enc) {
+    if (enc === null || enc === undefined) return null;
+    var e = String(enc).toLowerCase();
+    if (e === 'utf8' || e === 'utf-8') return 'utf8';
+    if (e === 'latin1' || e === 'binary') return 'latin1';
+    if (e === 'ascii') return 'ascii';
+    if (e === 'base64') return 'base64';
+    // Unknown encodings fall back to UTF-8 rather than throwing
+    // ERR_UNKNOWN_ENCODING: a readable string degrades far better inside the
+    // engine than an exception on a path the engine did not expect to fail.
+    return 'utf8';
+  }
+
+  function decodeWith(enc, bytes) {
+    if (enc === 'latin1') return latin1Decode(bytes);
+    if (enc === 'ascii') return asciiDecode(bytes);
+    if (enc === 'base64') return toBase64(bytes);
+    return utf8Decode(bytes);
+  }
+
+  /** Coerce `writeFileSync` data (string / Uint8Array / ArrayBuffer / array). */
+  function toWriteBytes(data, options) {
+    if (typeof data === 'string') {
+      var enc = canonicalEncoding(parseEncoding(options)) || 'utf8';
+      if (enc === 'base64') return toBuffer(data);
+      if (enc === 'latin1') return latin1Encode(data);
+      if (enc === 'ascii') return asciiEncode(data);
+      return utf8Encode(data);
+    }
+    if (data === null || data === undefined) return new Uint8Array(0);
+    if (typeof Uint8Array !== 'undefined' && data instanceof Uint8Array) return data;
+    if (typeof ArrayBuffer !== 'undefined') {
+      if (data instanceof ArrayBuffer) return new Uint8Array(data);
+      if (ArrayBuffer.isView && ArrayBuffer.isView(data)) {
+        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      }
+    }
+    if (typeof data.length === 'number') {
+      var out = new Uint8Array(data.length);
+      for (var i = 0; i < data.length; i++) out[i] = data[i] & 0xff;
+      return out;
+    }
+    throw new TypeError('fs.writeFileSync: data must be a string or a Uint8Array');
+  }
+
+  /** The shape Node's `statSync` returns, reconstructed from host JSON. */
+  function makeStats(info) {
+    var isDir = !!(info && info.isDirectory);
+    var size = (info && typeof info.size === 'number') ? info.size : 0;
+    var nowMs = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
+    return {
+      size: size,
+      mtimeMs: nowMs,
+      atimeMs: nowMs,
+      ctimeMs: nowMs,
+      birthtimeMs: nowMs,
+      mtime: new Date(nowMs),
+      atime: new Date(nowMs),
+      ctime: new Date(nowMs),
+      birthtime: new Date(nowMs),
+      isDirectory: function () { return isDir; },
+      isFile: function () { return !isDir; },
+      isSymbolicLink: function () { return false; },
+      isBlockDevice: function () { return false; },
+      isCharacterDevice: function () { return false; },
+      isFIFO: function () { return false; },
+      isSocket: function () { return false; }
+    };
+  }
+
+  /** Schedule `fn` on the macrotask queue, the way Node's async fs does. */
+  function defer(fn) {
+    if (typeof setTimeout === 'function') setTimeout(fn, 0);
+    else fn();
+  }
+
+  var fsModule = {
+    existsSync: function (p) {
+      try {
+        return hostCall('exists', resolvePath(p)) === true;
+      } catch (e) {
+        return false;
+      }
+    },
+
+    readFileSync: function (p, options) {
+      var abs = resolvePath(p);
+      var b64 = hostCall('readBase64', abs);
+      if (typeof b64 !== 'string') throw lookupFailure(abs, 'open', 'EISDIR');
+      var bytes = toBuffer(b64);
+      var enc = canonicalEncoding(parseEncoding(options));
+      return (enc === null) ? bytes : decodeWith(enc, bytes);
+    },
+
+    writeFileSync: function (p, data, options) {
+      var abs = resolvePath(p);
+      if (!isWithinRoots(abs)) throw fsError('EACCES', 'open', abs);
+      var bytes = toWriteBytes(data, options);
+      if (hostCall('writeBase64', abs, toBase64(bytes)) !== true) {
+        var info = parseStat(hostCall('stat', abs));
+        if (info && info.isDirectory) throw fsError('EISDIR', 'open', abs);
+        throw fsError('EACCES', 'open', abs);
+      }
+      return undefined;
+    },
+
+    readdirSync: function (p) {
+      var abs = resolvePath(p);
+      var info = parseStat(hostCall('stat', abs));
+      if (!info) throw lookupFailure(abs, 'scandir', 'ENOENT');
+      if (!info.isDirectory) throw fsError('ENOTDIR', 'scandir', abs);
+      var text = hostCall('readDir', abs);
+      var names = null;
+      if (typeof text === 'string') {
+        try {
+          names = JSON.parse(text);
+        } catch (e) {
+          names = null;
+        }
+      }
+      if (!names || typeof names.length !== 'number') {
+        throw fsError('EACCES', 'scandir', abs);
+      }
+      return names;
+    },
+
+    statSync: function (p) {
+      var abs = resolvePath(p);
+      var info = parseStat(hostCall('stat', abs));
+      if (!info) {
+        if (!isWithinRoots(abs)) throw fsError('EACCES', 'stat', abs);
+        throw fsError('ENOENT', 'stat', abs);
+      }
+      return makeStats(info);
+    },
+
+    mkdirSync: function (p, options) {
+      var abs = resolvePath(p);
+      var recursive = !!(options && typeof options === 'object' && options.recursive);
+      if (!isWithinRoots(abs)) throw fsError('EACCES', 'mkdir', abs);
+      if (recursive) {
+        if (hostCall('mkdirp', abs) !== true) throw fsError('EACCES', 'mkdir', abs);
+        return undefined;
+      }
+      // Non-recursive `mkdir` must fail like Node when the target already
+      // exists or the parent is missing; the host only offers a recursive
+      // primitive, so those two cases are checked here first.
+      if (hostCall('exists', abs) === true) throw fsError('EEXIST', 'mkdir', abs);
+      var parent = dirname(abs);
+      var parentInfo = parseStat(hostCall('stat', parent));
+      if (!parentInfo) throw fsError('ENOENT', 'mkdir', abs);
+      if (!parentInfo.isDirectory) throw fsError('ENOTDIR', 'mkdir', abs);
+      if (hostCall('mkdirp', abs) !== true) throw fsError('EACCES', 'mkdir', abs);
+      return undefined;
+    },
+
+    unlinkSync: function (p) {
+      var abs = resolvePath(p);
+      if (hostCall('unlink', abs) === true) return undefined;
+      if (!isWithinRoots(abs)) throw fsError('EACCES', 'unlink', abs);
+      var info = parseStat(hostCall('stat', abs));
+      if (!info) throw fsError('ENOENT', 'unlink', abs);
+      if (info.isDirectory) throw fsError('EISDIR', 'unlink', abs);
+      throw fsError('EACCES', 'unlink', abs);
+    },
+
+    /* ---- asynchronous forms: the sync implementation, deferred ---- */
+
+    readFile: function (p, options, cb) {
+      if (typeof options === 'function') { cb = options; options = undefined; }
+      if (typeof cb !== 'function') return undefined;
+      defer(function () {
+        var value;
+        try {
+          value = fsModule.readFileSync(p, options);
+        } catch (err) {
+          cb(err);
+          return;
+        }
+        cb(null, value);
+      });
+      return undefined;
+    },
+
+    writeFile: function (p, data, options, cb) {
+      if (typeof options === 'function') { cb = options; options = undefined; }
+      if (typeof cb !== 'function') return undefined;
+      defer(function () {
+        try {
+          fsModule.writeFileSync(p, data, options);
+        } catch (err) {
+          cb(err);
+          return;
+        }
+        cb(null);
+      });
+      return undefined;
+    },
+
+    readdir: function (p, options, cb) {
+      if (typeof options === 'function') { cb = options; options = undefined; }
+      if (typeof cb !== 'function') return undefined;
+      defer(function () {
+        var value;
+        try {
+          value = fsModule.readdirSync(p, options);
+        } catch (err) {
+          cb(err);
+          return;
+        }
+        cb(null, value);
+      });
+      return undefined;
+    },
+
+    stat: function (p, cb) {
+      if (typeof cb !== 'function') return undefined;
+      defer(function () {
+        var value;
+        try {
+          value = fsModule.statSync(p);
+        } catch (err) {
+          cb(err);
+          return;
+        }
+        cb(null, value);
+      });
+      return undefined;
+    },
+
+    mkdir: function (p, options, cb) {
+      if (typeof options === 'function') { cb = options; options = undefined; }
+      if (typeof cb !== 'function') return undefined;
+      defer(function () {
+        try {
+          fsModule.mkdirSync(p, options);
+        } catch (err) {
+          cb(err);
+          return;
+        }
+        cb(null);
+      });
+      return undefined;
+    }
+  };
+
+  /* ------------------------------------------------------------------ *
    * `require` with a lazy no-op fallback
    * ------------------------------------------------------------------ */
 
@@ -519,7 +1023,8 @@
   var modules = {
     path: pathModule,
     os: osModule,
-    process: processObject
+    process: processObject,
+    fs: fsModule
   };
 
   function requireModule(name) {
