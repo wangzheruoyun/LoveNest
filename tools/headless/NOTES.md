@@ -211,6 +211,12 @@ Live2D/Wasm loader resolves `Buffer` off `globalThis` via
 `_getAttributeFromParentPages('Buffer')`. `window.require` (already the Task 4
 fix) is what makes `os.platform` and `W26_WindowsFullName.get()` succeed.
 
+`renameSync`/`rmdirSync` are **not** read-only members: they call the host's
+`rename(path, toPath)` / `rmdir(path)` and turn a `false` reply into Node's error
+(`ENOENT`/`ENOTEMPTY`/`ENOTDIR`/`EACCES`). On device that makes them real
+(`File.renameTo` / `File.delete`); in the headless in-page host they are logged
+no-ops. See "Host contract extended" below.
+
 **`fetch` was deliberately *not* overridden.** The only `fetch(` call site in the
 engine is `fetch('https://api.ip.sb/geoip')` (`rv.js:92561`); the other
 occurrences live inside the WAsm loader behind `typeof fetch` guards. The host
@@ -220,11 +226,22 @@ in the init script at that point rather than pre-emptively.
 
 ### Residual, expected output (none of it a `pageerror`)
 
-- `43` `[requestfailed]` lines: the Demo's genuinely missing
-  `btn_normal/over/click.png` and first-run-missing `savedata/life.gcdata(.bak)`,
-  `asset/json/ui/uiCompSetting.json`, plus documented save/wallpaper paths under
-  `晴小姐\日记.txt` and `\AppData\Roaming\cicigames`. All are `ERR_FILE_NOT_FOUND`
-  (or the loopback `:ffff:` equivalents), i.e. *absence*, not corruption.
+- `43` `[requestfailed]` lines, **none a port defect**. Only **3** are
+  genuinely missing Demo assets (`asset/image/picture/control/btn_normal.png`,
+  `btn_over.png`, `btn_click.png`; the folder holds only scrollbar/checkbox/tab
+  art). The other **40** are:
+  - first-run-missing `savedata/` state — `savedata/life.gcdata`,
+    `savedata/life.gcdatabak`, and the `savedata` directory itself (repeated a
+    few times as the engine probes);
+  - `asset/json/ui/uiCompSetting.json` — the `asset/json/ui/` directory does not
+    exist in this build;
+  - the docs-root `…/爱之巢/logs` directory (never created headless);
+  - write-then-read-back paths under gameRoot — `\AppData\Roaming\cicigames…`,
+    `\Desktop\…`, `晴小姐\日记.txt` — which fail *only* because no-op writes
+    discard them.
+
+  All decode to `ERR_FILE_NOT_FOUND` (i.e. *absence*, not path mangling of an
+  existing asset), so no existing game file is being mis-addressed.
 - `22` `[host:…]` no-op / Android-capability log lines — proof the host was
   actually called.
 - Offline `当前城市: Tiruvānmiyūr` (geoip) and the `gamecreator.com.cn` OpenAPI
@@ -233,6 +250,56 @@ in the init script at that point rather than pre-emptively.
   no error — the write path runs; it simply discards, because in-page writes are
   no-ops by design. **This is a real limitation of the headless host: it cannot
   verify that saves actually persist.** Persistence is Task 7/9's job on-device.
+
+### Host contract extended (Fix round 1) — `rename` / `rmdir`
+
+The original Task 5 `renameSync`/`rmdirSync` validated paths and then reported
+success **without calling the host**. That is fine-ish headless, but the same
+`gc-bridge.js` runs on device, so a "successful" rename or rmdir would change
+nothing there — and the engine really does call both
+(`renameSync` @`script.js` char 8696204, `rmdirSync` @4520184). Extending the
+`__GCNative` interface with two members fixes this at the source:
+
+| Host method | Bridge semantics on `false` |
+|---|---|
+| `rename(path, toPath) -> Boolean` | `ENOENT` when the source is missing, `EACCES` on an escape (either end) |
+| `rmdir(path) -> Boolean` | `ENOENT` missing, `ENOTDIR` not a dir, `ENOTEMPTY` non-empty dir, `EACCES` on an escape |
+
+`inpage-host.js` exposes both as logged no-ops returning `true` (consistent with
+its `writeBase64`/`mkdirp`/`unlink`), so the headless run keeps passing and stays
+a faithful twin of `GameBridge.kt`.
+
+> **`host-native.js` (the Task 1 Node host) was deliberately not touched** — it
+> is a committed interface artifact. It still exposes 19 methods, so it is one
+> phase behind the extended 21-method contract. `bridge.test.js` supplies
+> `rename`/`rmdir` on the host it constructs for the mutation tests. **`GameBridge.kt`
+> (Task 7) must implement `rename(path, toPath)` and `rmdir(path)`** (e.g.
+> `File.renameTo` / `File.delete`) or save rotation silently loses saves on device.
+
+### `accessSync` ignores `mode` (recorded limitation)
+
+`fs.accessSync`/`access` map any `mode` to a plain existence check, because the
+host only exposes reachability. So `W_OK` reports every existing file as
+writable, and a genuine on-device write-permission failure (`EACCES`) would be
+masked. Nothing in the current engine relies on a `W_OK` failure, but this is a
+known fidelity gap, not a guarantee.
+
+### Environmental console patterns treated as non-errors (Fix round 1)
+
+`run.js`'s `isEnvironmental()` anchors on the exact three shapes the
+headless/SwiftShader layer emits, matched per line of the `pageerror` text:
+
+```
+WebGL: CONTEXT_LOST_WEBGL:
+[.WebGL-<hex>]GL Driver Message (<backend, …>): GPU stall
+shader error null
+```
+
+A bare `shader` / `GPU` substring match was rejected: a real engine error that
+merely mentioned those words would have been silently reclassified. In the
+reviewed runs the environmental count is `0` (the context loss surfaces as a
+console warning, not a `pageerror`), so the green result does not depend on this
+filter at all.
 
 ### WebGL is blank here — environmental, not a port regression
 

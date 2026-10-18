@@ -85,12 +85,18 @@ const MAIN_COUNT_SNIPPET =
 
 /**
  * Page errors that come from the headless GPU stack rather than the port.
- * WebGL context loss and `shader error null` are documented environmental
- * artefacts (NOTES.md baseline B, plan carry-forward); they are counted and
- * reported separately, never as port regressions.
+ *
+ * The SwiftShader/headless GL layer produces exactly these three shapes, and
+ * they arrive as `WebGL:` / `[.WebGL-…]GL Driver Message` lines (a `pageerror`
+ * carries a whole stack, hence the multi-line anchors). Matching the full shape
+ * rather than a bare substring keeps a real engine error that merely mentions
+ * "shader" or "GPU" from being silently reclassified as environmental.
  */
 function isEnvironmental(message) {
-  return /CONTEXT_LOST_WEBGL|shader error|GPU stall/i.test(message);
+  const text = String(message);
+  return /^WebGL: CONTEXT_LOST_WEBGL:/m.test(text) ||
+    /^\[\.WebGL-[0-9a-fx]+\]GL Driver Message \([^)]*\): GPU stall/m.test(text) ||
+    /^shader error null$/m.test(text);
 }
 
 function stamp() {

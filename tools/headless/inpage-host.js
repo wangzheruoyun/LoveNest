@@ -17,10 +17,10 @@
  * Capability split (Ruling 7):
  *   - read-only path: `exists` / `stat` / `readBase64` / `readDir` are backed
  *     by a synchronous `file://` XHR.
- *   - write path: `writeBase64` / `mkdirp` / `unlink` are logged no-ops that
- *     report success (`true`). The game folder must stay byte-identical
- *     (NOTES.md "Housekeeping"), and a headless run has no real save location
- *     to write to. That limitation is recorded in NOTES.md.
+ *   - write path: `writeBase64` / `mkdirp` / `unlink` / `rename` / `rmdir` are
+ *     logged no-ops that report success (`true`). The game folder must stay
+ *     byte-identical (NOTES.md "Housekeeping"), and a headless run has no real
+ *     save location to write to. That limitation is recorded in NOTES.md.
  *   - Android-only capabilities (`setWallpaper` / `toast` / `fakeShutdown` /
  *     `openFile` / `vibrate` / clipboard) become console log lines.
  *
@@ -117,6 +117,11 @@
   function rawGet(url) {
     var xhr = new XMLHttpRequest();
     xhr.open('GET', url, false);
+    // `x-user-defined` keeps the body byte-for-byte: each byte becomes one
+    // UTF-16 code unit, so `responseText.length` *is* the byte length (verified:
+    // icon.png 2361 bytes → 2361, vs 2234 without the override). Directory
+    // listings are ASCII so their `addRow(...)` parsing is unaffected.
+    if (xhr.overrideMimeType) xhr.overrideMimeType('text/plain; charset=x-user-defined');
     try {
       xhr.send();
     } catch (e) {
@@ -222,7 +227,12 @@
       var entry = findEntry(listing.text, basenameOf(path));
       if (entry) return JSON.stringify({ isDirectory: entry.isDir, size: entry.size });
     }
-    if (self.kind === 'file') return JSON.stringify({ isDirectory: false, size: self.text.length });
+    if (self.kind === 'file') {
+      // Invariant: `rawGet` opens with `charset=x-user-defined`, so the body is
+      // one UTF-16 code unit per byte and `text.length` equals the byte length
+      // (see `rawGet`). This fallback therefore reports a real byte size.
+      return JSON.stringify({ isDirectory: false, size: self.text.length });
+    }
     return null;
   }
 
@@ -265,6 +275,20 @@
     return path !== null;
   }
 
+  function rename(p, to) {
+    var path = resolveWithin(p);
+    var target = resolveWithin(to);
+    emit('rename', 'no-op ' + (path === null ? String(p) : path) +
+      ' -> ' + (target === null ? String(to) : target));
+    return path !== null && target !== null;
+  }
+
+  function rmdir(p) {
+    var path = resolveWithin(p);
+    emit('rmdir', 'no-op ' + (path === null ? String(p) : path));
+    return path !== null;
+  }
+
   /* ------------------------------------------------------------------ *
    * Android-only capabilities: console log lines.
    * ------------------------------------------------------------------ */
@@ -287,6 +311,8 @@
     writeBase64: writeBase64,
     mkdirp: mkdirp,
     unlink: unlink,
+    rename: rename,
+    rmdir: rmdir,
 
     deviceName: function () { return 'Pixel Owner'; },
     androidVersion: function () { return '14'; },

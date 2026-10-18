@@ -654,7 +654,8 @@
     EACCES: -13,
     EEXIST: -17,
     ENOTDIR: -20,
-    EISDIR: -21
+    EISDIR: -21,
+    ENOTEMPTY: -39
   };
 
   var FS_STRERROR = {
@@ -662,7 +663,8 @@
     EACCES: 'permission denied',
     EEXIST: 'file already exists',
     ENOTDIR: 'not a directory',
-    EISDIR: 'illegal operation on a directory'
+    EISDIR: 'illegal operation on a directory',
+    ENOTEMPTY: 'directory not empty'
   };
 
   /** Build a Node-shaped `Error` carrying `code` / `errno` / `syscall` / `path`. */
@@ -1013,28 +1015,40 @@
     },
 
     /**
-     * `renameSync` / `rmdirSync` have no host primitive and the write path is a
-     * no-op, so they validate the same way Node does (root containment, source
-     * existence) and then report success without touching the game folder. A
-     * later read of the moved path therefore sees the old state — the accepted
-     * write-is-no-op limitation recorded in NOTES.md.
+     * `renameSync` / `rmdirSync` reach the host (`rename` / `rmdir`), so on
+     * Android they become real operations (`File.renameTo` / `File.delete`)
+     * rather than silent no-ops: a "successful" rename that moves nothing
+     * would lose or corrupt saves during rotation. A `false` host reply is
+     * turned into Node's error for the same syscall (Ruling 6), chosen from the
+     * same host primitives every other member uses.
      */
     renameSync: function (oldPath, newPath) {
       var from = resolvePath(oldPath);
       var to = resolvePath(newPath);
       if (!isWithinRoots(from)) throw fsError('EACCES', 'rename', from);
       if (!isWithinRoots(to)) throw fsError('EACCES', 'rename', to);
+      if (hostCall('rename', from, to) === true) return undefined;
+      // The host refused (or offers no `rename`): report what Node would.
       if (hostCall('exists', from) !== true) throw fsError('ENOENT', 'rename', from);
-      return undefined;
+      throw fsError('EACCES', 'rename', from);
     },
 
     rmdirSync: function (p) {
       var abs = resolvePath(p);
       if (!isWithinRoots(abs)) throw fsError('EACCES', 'rmdir', abs);
+      if (hostCall('rmdir', abs) === true) return undefined;
+      // Classify the refusal the way Node does.
       var info = parseStat(hostCall('stat', abs));
       if (!info) throw fsError('ENOENT', 'rmdir', abs);
       if (!info.isDirectory) throw fsError('ENOTDIR', 'rmdir', abs);
-      return undefined;
+      var names = null;
+      try {
+        names = fsModule.readdirSync(abs);
+      } catch (e) {
+        names = null;
+      }
+      if (names && names.length > 0) throw fsError('ENOTEMPTY', 'rmdir', abs);
+      throw fsError('EACCES', 'rmdir', abs);
     },
 
     createReadStream: makeReadStream,
@@ -1111,6 +1125,34 @@
       defer(function () {
         try {
           fsModule.mkdirSync(p, options);
+        } catch (err) {
+          cb(err);
+          return;
+        }
+        cb(null);
+      });
+      return undefined;
+    },
+
+    rename: function (oldPath, newPath, cb) {
+      if (typeof cb !== 'function') return undefined;
+      defer(function () {
+        try {
+          fsModule.renameSync(oldPath, newPath);
+        } catch (err) {
+          cb(err);
+          return;
+        }
+        cb(null);
+      });
+      return undefined;
+    },
+
+    rmdir: function (p, cb) {
+      if (typeof cb !== 'function') return undefined;
+      defer(function () {
+        try {
+          fsModule.rmdirSync(p);
         } catch (err) {
           cb(err);
           return;
