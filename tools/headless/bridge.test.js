@@ -276,3 +276,47 @@ test('fs 异步回调形态：readFile/writeFile/readdir/stat/mkdir，错误走�
   });
   assert.strictEqual(err.code, 'ENOENT');
 });
+
+/* ------------------------------------------------------------------ *
+ * Fix round 1 — two Minor review findings
+ * ------------------------------------------------------------------ */
+
+test('宿主返回带尾斜杠的 gameRoot/docsRoot 时，根边界判定仍然正确', () => {
+  const nodeFs = require('node:fs');
+  // Task 7 的 Kotlin 只承诺 `-> String`；尾斜杠是合理的手误，桩层必须自愈。
+  const rawGameRoot = GAME_ROOT + '/';
+  const rawDocsRoot = '/tmp/lovenest-docs-trailing/';
+  const host = Object.assign({}, createHost({ gameRoot: GAME_ROOT, docsRoot: rawDocsRoot }), {
+    gameRoot: () => rawGameRoot,
+    docsRoot: () => rawDocsRoot
+  });
+  const w = loadBridge(host);
+  const fsShim = w.require('fs');
+  assert.strictEqual(w.process.cwd(), GAME_ROOT, 'cwd 不得带尾斜杠');
+  // 根内读取必须可用，而不是被误判为越界（EACCES）
+  assert.strictEqual(fsShim.existsSync(GAME_ROOT + '/index.html'), true);
+  const p = rawDocsRoot + 'save-trailing.json';
+  fsShim.writeFileSync(p, 'ok');
+  assert.strictEqual(fsShim.readFileSync(p, 'utf8'), 'ok');
+  // 根内缺失路径应为 ENOENT，而不是 EACCES
+  assert.throws(() => fsShim.readFileSync(rawDocsRoot + 'missing.json'), (err) => err.code === 'ENOENT');
+  // 爬升出根的路径仍必须被拒绝，且不得落盘
+  assert.throws(() => fsShim.writeFileSync(rawDocsRoot + '../lovenest-escape-trailing.txt', 'x'),
+    (err) => err.code === 'EACCES');
+  assert.strictEqual(nodeFs.existsSync('/tmp/lovenest-escape-trailing.txt'), false);
+});
+
+test('fs.stat 异步支持 (path, options, cb) 形态，回调不得被吞掉', async () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const fsShim = w.require('fs');
+  const result = await Promise.race([
+    new Promise((resolve, reject) => {
+      fsShim.stat(GAME_ROOT + '/index.html', { bigint: false }, (err, value) => {
+        if (err) reject(err); else resolve(value);
+      });
+    }),
+    new Promise((resolve) => setTimeout(() => resolve('TIMEOUT'), 1000))
+  ]);
+  assert.notStrictEqual(result, 'TIMEOUT', 'fs.stat(path, options, cb) 的回调必须被调用');
+  assert.strictEqual(result.isFile(), true);
+});

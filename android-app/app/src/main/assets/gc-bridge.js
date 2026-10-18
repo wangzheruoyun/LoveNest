@@ -46,16 +46,33 @@
    * Native host helpers
    * ------------------------------------------------------------------ */
 
+  /**
+   * Strip trailing slashes from a host-reported root (leaving `/` alone).
+   *
+   * The `__GCNative` contract only promises `gameRoot() -> String`; nothing
+   * guarantees it is normalised. A trailing slash would break the lexical
+   * containment check in `isInsideRoot` (`root + '/'` becomes `//`), making
+   * every in-root path look like an escape — every save would fail with a
+   * misleading `EACCES`. Normalising here, at the single read point, keeps
+   * `process.cwd()`/`resolvePath()` clean too.
+   */
+  function normalizeRoot(p) {
+    var s = String(p == null ? '' : p);
+    var end = s.length;
+    while (end > 1 && s.charAt(end - 1) === '/') end--;
+    return s.slice(0, end);
+  }
+
   function gameRoot() {
     if (host && typeof host.gameRoot === 'function') {
-      return String(host.gameRoot());
+      return normalizeRoot(host.gameRoot());
     }
     return '/';
   }
 
   function docsRoot() {
     if (host && typeof host.docsRoot === 'function') {
-      return String(host.docsRoot());
+      return normalizeRoot(host.docsRoot());
     }
     return '/';
   }
@@ -926,7 +943,8 @@
       return undefined;
     },
 
-    stat: function (p, cb) {
+    stat: function (p, options, cb) {
+      if (typeof options === 'function') { cb = options; options = undefined; }
       if (typeof cb !== 'function') return undefined;
       defer(function () {
         var value;
