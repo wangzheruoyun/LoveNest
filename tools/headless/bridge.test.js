@@ -320,3 +320,247 @@ test('fs.stat 异步支持 (path, options, cb) 形态，回调不得被吞掉', 
   assert.notStrictEqual(result, 'TIMEOUT', 'fs.stat(path, options, cb) 的回调必须被调用');
   assert.strictEqual(result.isFile(), true);
 });
+
+/* ------------------------------------------------------------------ *
+ * Task 4 — `child_process` command mapping and `nw.gui`
+ *
+ * The command table is derived from the decoded engine source, not guessed:
+ * see the Task 4 report for the enumerated call sites. Each test drives the
+ * shim through the exact call shapes the engine uses (`execSync(cmd, {encoding:
+ * 'buffer'})`, `exec(cmd, cb)`, `spawn(exe, args)`).
+ * ------------------------------------------------------------------ */
+
+test('wmic os get Caption 返回纯 ASCII 的 Android 版本串', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const cp = w.require('child_process');
+  const out = cp.execSync('chcp 936 && wmic os get Caption', { encoding: 'buffer' });
+  const s = Buffer.from(out).toString('latin1');
+  assert.ok(/^[\x00-\x7F]*$/.test(s), '输出必须全为 ASCII，Review Focus #4');
+  assert.ok(s.indexOf('Android') >= 0 || s.indexOf('android') >= 0);
+});
+
+test('wmic useraccount 返回非空设备名', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const s = w.require('child_process').execSync('chcp 936 && wmic useraccount where name="x" get fullname');
+  assert.ok(String(s).length > 0);
+});
+
+test('关机命令触发 fakeShutdown 而不是真的执行', () => {
+  let shut = 0;
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.fakeShutdown = () => { shut++; };
+  const w = loadBridge(host);
+  w.require('child_process').exec(GAME_ROOT + '/asset/pcSys/nircmd.exe "shutdown"');
+  assert.strictEqual(shut, 1);
+});
+
+test('本 Demo 实际的断电演出 nircmd.exe hibernate 同样走 fakeShutdown', () => {
+  let shut = 0;
+  const logs = [];
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.fakeShutdown = () => { shut++; };
+  host.log = (s) => { logs.push(String(s)); };
+  const w = loadBridge(host);
+  const cp = w.require('child_process');
+  // customCommand_15033 → W26_VisualSysOpt.hibernate()
+  cp.exec('"' + GAME_ROOT + '/asset/pcSys/nircmd.exe" hibernate', () => {});
+  assert.strictEqual(shut, 1, 'Demo 的关机演出必须映射到安卓退出表演');
+  // customCommand_15032 → W26_VisualSysOpt.offMonitor()：「关闭显示器」尚无宿主能力
+  cp.exec('"undefined\\system32\\scrnsave.scr" /s', () => {});
+  assert.strictEqual(shut, 1, '关显示器不得被当成关机');
+  assert.ok(logs.some((s) => s.indexOf('scrnsave.scr') >= 0), '关显示器必须留痕而非静默');
+});
+
+test('nw.gui 提供 Window.get / Clipboard.get / Shell.openItem', () => {
+  const w = loadBridge(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const nw = w.require('nw.gui');
+  assert.strictEqual(typeof nw.Window.get, 'function');
+  assert.strictEqual(typeof nw.Window.get().close, 'function');
+  assert.strictEqual(typeof nw.Clipboard.get().set, 'function');
+  assert.strictEqual(typeof nw.Shell.openItem, 'function');
+  // 注意：本用例对 Task 2 的 no-op 代理是「真空通过」的（代理的任意属性都是可调用
+  // 函数），因此它只固定接口形状；真实行为由下面 Window/Clipboard/Shell 的用例覆盖。
+});
+
+/* ---- Task 4 extra coverage ---- */
+
+test('设备名非 ASCII 时 GBK 缓冲路径仍返回纯 ASCII（Review Focus #4）', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.deviceName = () => '张三的 OnePlus 12';
+  const w = loadBridge(host);
+  const cp = w.require('child_process');
+  const buf = cp.execSync('chcp 936 && wmic useraccount where name="x" get fullname', { encoding: 'buffer' });
+  const s = Buffer.from(buf).toString('latin1');
+  assert.ok(/^[\x00-\x7F]*$/.test(s), '非 ASCII 设备名必须被净化');
+  assert.ok(s.indexOf('OnePlus 12') >= 0, '可读的 ASCII 部分必须保留');
+  assert.ok(s.indexOf('张三') < 0);
+});
+
+test('wmic useraccount 的输出形状可供引擎 split("\\n")[2].trim() 取值', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.deviceName = () => 'Pixel Owner';
+  const w = loadBridge(host);
+  const cp = w.require('child_process');
+  // 引擎：W26_WindowsFullName.fullName = execSync(...).decode(gbk).split("\n")[2].trim()
+  const buf = cp.execSync('chcp 936 && wmic useraccount where name="x" get fullname', { encoding: 'buffer' });
+  const info = Buffer.from(buf).toString('latin1');
+  assert.strictEqual(info.split('\n')[2].trim(), 'Pixel Owner');
+});
+
+test('net user %username% 走设备名，且解析后与设备名逐字一致', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.deviceName = () => 'Pixel Owner';
+  const w = loadBridge(host);
+  const cp = w.require('child_process');
+  // 忠实复刻引擎 W26_VisualSysOpt.getWindowsFullName 的解析逻辑。
+  const info = String(cp.execSync('chcp 936 && net user %username%'));
+  const arr = info.split('\n')[2].split(' ');
+  let fullName = '';
+  let add = false;
+  for (let i = 1; i < arr.length; i++) {
+    if (arr[i] !== '') add = true;
+    if (add) fullName += arr[i] + ' ';
+  }
+  if (fullName.length > 0) fullName = fullName.substr(0, fullName.length - 2);
+  assert.strictEqual(fullName, 'Pixel Owner', '引擎切掉末两字符后仍须得到完整设备名');
+});
+
+test('reg add ... /v Wallpaper 读取游戏内图片并以 base64 交给宿主 setWallpaper', () => {
+  let wall = null;
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.setWallpaper = (b64) => { wall = b64; return true; };
+  const w = loadBridge(host);
+  const img = GAME_ROOT + '/asset/pcSys/nircmd.exe'; // 任何真实文件均可，MZ 头便于断言
+  w.require('child_process').execSync(
+    'reg add "HKEY_CURRENT_USER\\Control Panel\\Desktop" /v Wallpaper /t REG_SZ /d "' + img + '" /f');
+  assert.ok(typeof wall === 'string' && wall.length > 0, 'setWallpaper 必须被调用');
+  const bytes = Buffer.from(wall, 'base64');
+  assert.strictEqual(bytes[0], 0x4d, 'M');
+  assert.strictEqual(bytes[1], 0x5a, 'Z');
+  // 刷新桌面的 rundll32 命令不得误触发壁纸替换
+  wall = null;
+  w.require('child_process').execSync('rundll32.exe user32.dll,UpdatePerUserSystemParameters');
+  assert.strictEqual(wall, null);
+});
+
+test('trayballoon 命令转为宿主 toast，并把消息正文带给用户', () => {
+  const toasts = [];
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.toast = (m) => { toasts.push(String(m)); };
+  const w = loadBridge(host);
+  w.require('child_process').execSync(
+    GAME_ROOT + '/asset/pcSys/trayballoon.exe "标题" "不要再看了" "5000" "0" "1" ');
+  assert.strictEqual(toasts.length, 1);
+  assert.ok(toasts[0].indexOf('不要再看了') >= 0, '气泡正文必须传给 toast');
+});
+
+test('未映射的 Windows 命令写宿主日志并返回空串；exec 的 stdout 通过回调异步送达', async () => {
+  const logs = [];
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.log = (s) => { logs.push(String(s)); };
+  const w = loadBridge(host);
+  const cp = w.require('child_process');
+  assert.strictEqual(cp.execSync('chcp 936 && wmic cpu get Name'), '');
+  assert.ok(logs.some((s) => s.indexOf('wmic cpu get Name') >= 0), '未映射命令必须记录');
+  const buf = cp.execSync('chcp 936 && wmic memorychip get Capacity', { encoding: 'buffer' });
+  assert.ok(buf && typeof buf.length === 'number' && buf.length === 0);
+  const seen = await new Promise((resolve, reject) => {
+    cp.exec('chcp 936 && wmic cpu get Name', { encoding: 'buffer' }, (err, out, stderr) => {
+      if (err) reject(err); else resolve({ out, stderr });
+    });
+  });
+  assert.strictEqual(Buffer.from(seen.out).length, 0);
+  assert.strictEqual(seen.stderr, '', '引擎用 stderr.length > 0 判定失败，必须为空串');
+});
+
+test('exec 回调签名与 Node 一致：(error, stdout, stderr)，且不阻塞返回', async () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.androidVersion = () => '14';
+  const w = loadBridge(host);
+  const cp = w.require('child_process');
+  const seen = await new Promise((resolve) => {
+    const ret = cp.exec('chcp 936 && wmic os get Caption', { encoding: 'buffer' }, (err, out, stderr) => {
+      resolve({ err, out, stderr });
+    });
+    assert.strictEqual(ret, undefined, 'exec 必须立即返回 undefined');
+  });
+  assert.strictEqual(seen.err, null);
+  assert.strictEqual(Buffer.from(seen.out).toString('latin1'), 'Android 14');
+  assert.strictEqual(seen.stderr, '');
+});
+
+test('process.exec / process.execSync 转发到同一个命令路由器（Task 2 的接缝）', () => {
+  let shut = 0;
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.fakeShutdown = () => { shut++; };
+  host.androidVersion = () => '14';
+  const w = loadBridge(host);
+  // 修复前的 no-op 代理会让这两条断言静默通过/失败，故必须真正驱动副作用
+  w.process.exec(GAME_ROOT + '/asset/pcSys/nircmd.exe "shutdown"');
+  assert.strictEqual(shut, 1, 'process.exec 必须到达命令路由器');
+  assert.strictEqual(w.process.execSync('chcp 936 && wmic os get Caption'), 'Android 14');
+});
+
+test('spawn 返回带 on("close") 的子进程对象并把弹窗映射为 toast', async () => {
+  const toasts = [];
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.toast = (m) => { toasts.push(String(m)); };
+  const w = loadBridge(host);
+  const cp = w.require('child_process');
+  const exe = GAME_ROOT + '/asset/pcSys/MessageShow.exe';
+  const ps = cp.spawn(exe, ['正文', '标题', 'MB_OK', 'MB_ICONASTERISK'], { shell: false });
+  assert.strictEqual(typeof ps.on, 'function');
+  const code = await new Promise((resolve) => { ps.on('close', (c) => resolve(c)); });
+  assert.strictEqual(code, 0);
+  assert.strictEqual(toasts.length, 1);
+  assert.ok(toasts[0].indexOf('正文') >= 0);
+});
+
+test('nw.gui Window 提供引擎实际调用的全部成员，close 映射为宿主退出', () => {
+  let shut = 0;
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.fakeShutdown = () => { shut++; };
+  const w = loadBridge(host);
+  const win = w.require('nw.gui').Window.get();
+  ['close', 'hide', 'show', 'moveTo', 'resizeTo', 'minimize', 'maximize', 'restore',
+    'setResizable', 'setAlwaysOnTop', 'setMaximumSize', 'setMinimumSize',
+    'enterFullscreen', 'leaveFullscreen', 'getPrinters', 'print', 'on']
+    .forEach((name) => assert.strictEqual(typeof win[name], 'function', name + ' 必须是函数'));
+  assert.strictEqual(typeof win.x, 'number');
+  assert.strictEqual(typeof win.y, 'number');
+  assert.strictEqual(typeof win.width, 'number');
+  assert.strictEqual(typeof win.height, 'number');
+  // 引擎启动时即调用 Window.get()，且不会因这些调用抛出。
+  assert.doesNotThrow(() => {
+    win.setResizable(true);
+    win.moveTo(0, 0);
+    win.resizeTo(1600, 900);
+    win.enterFullscreen();
+    win.on('close', () => {});
+  });
+  assert.strictEqual(shut, 0, '普通窗口控制不得触发退出');
+  win.close(true);
+  assert.strictEqual(shut, 1, 'Window.close() 即安卓的退出应用');
+});
+
+test('nw.gui Clipboard 读写走宿主剪贴板桥', () => {
+  let set = null;
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.clipboardGet = () => '剪贴板内容';
+  host.clipboardSet = (s) => { set = String(s); };
+  const w = loadBridge(host);
+  const clip = w.require('nw.gui').Clipboard.get();
+  assert.strictEqual(clip.get('text'), '剪贴板内容');
+  clip.set('写回内容', 'text');
+  assert.strictEqual(set, '写回内容');
+});
+
+test('nw.gui Shell.openItem 走宿主的系统 Intent 打开文件', () => {
+  const opened = [];
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.openFile = (p) => { opened.push(String(p)); return true; };
+  const w = loadBridge(host);
+  const ok = w.require('nw.gui').Shell.openItem(GAME_ROOT + '/index.html');
+  assert.deepStrictEqual(opened, [GAME_ROOT + '/index.html']);
+  assert.strictEqual(ok, true);
+});

@@ -676,11 +676,20 @@
     return err;
   }
 
-  /** Call a host method, absorbing any host-side throw into `undefined`. */
+  /**
+   * Call a host method, absorbing any host-side throw into `undefined`.
+   *
+   * The arity matters on Android: `@JavascriptInterface` binds methods by name
+   * *and* parameter count, so calling a zero-argument host method with an
+   * extra `undefined` would miss the binding and throw. The no-argument branch
+   * below is therefore not cosmetic.
+   */
   function hostCall(name, arg1, arg2) {
     if (!host || typeof host[name] !== 'function') return undefined;
     try {
-      return (arg2 === undefined) ? host[name](arg1) : host[name](arg1, arg2);
+      if (arguments.length <= 1) return host[name]();
+      if (arg2 === undefined) return host[name](arg1);
+      return host[name](arg1, arg2);
     } catch (e) {
       return undefined;
     }
@@ -976,6 +985,273 @@
   };
 
   /* ------------------------------------------------------------------ *
+   * Windows command layer — `child_process` and `nw.gui`
+   *
+   * The engine is a Windows-only NW.js build whose "fourth wall" Meta
+   * performances read the player's real account name, read the Windows
+   * version, change the desktop wallpaper, pop a tray balloon and shut the
+   * computer down. Every one of them reaches the OS through
+   * `require('child_process')` or `require('nw.gui')`; the call sites were
+   * enumerated from the decoded engine source rather than guessed (see the
+   * Task 4 report for the full list).
+   *
+   * This layer maps each command onto a *real* Android equivalent on the
+   * native host instead of pretending to run it, so the performances survive
+   * the port instead of silently becoming no-ops.
+   * ------------------------------------------------------------------ */
+
+  /**
+   * Force a command result to pure ASCII, replacing anything above U+007F.
+   *
+   * The engine decodes `execSync(cmd, {encoding: 'buffer'})` output with
+   * `new TextDecoder('gbk')`. A byte above 0x7F that is not valid GBK corrupts
+   * the decode, so every string handed back on that path must stay ASCII.
+   * `androidVersion()` is already ASCII; `deviceName()` (the phone's name,
+   * often Chinese) is not.
+   */
+  function asciiOnly(value) {
+    var s = String(value == null ? '' : value);
+    var out = '';
+    for (var i = 0; i < s.length; i++) {
+      var code = s.charCodeAt(i);
+      out += (code < 0x80) ? s.charAt(i) : '?';
+    }
+    return out;
+  }
+
+  /** Read a host string accessor, mapping a missing/failed host to `''`. */
+  function hostString(name) {
+    var value = hostCall(name);
+    return (value === undefined || value === null) ? '' : String(value);
+  }
+
+  /** `"…"` groups of a Windows command line, in order. */
+  function quotedArgs(text) {
+    var out = [];
+    var re = /"([^"]*)"/g;
+    var m;
+    while ((m = re.exec(text)) !== null) out.push(m[1]);
+    return out;
+  }
+
+  /** True for the flags of a nircmd/MessageShow box that are not user text. */
+  function isPopupFlag(part) {
+    return part === '' || part === 'infobox' || part === 'qboxcom' ||
+      part.indexOf('MB_') === 0 || /^[0-9]+$/.test(part);
+  }
+
+  /** Human-readable notification text from a Windows popup command. */
+  function popupMessage(parts) {
+    var kept = [];
+    for (var i = 0; i < parts.length; i++) {
+      var part = String(parts[i]);
+      if (!isPopupFlag(part)) kept.push(part);
+    }
+    return kept.join(' ');
+  }
+
+  /**
+   * `reg add "…Control Panel\Desktop" /v Wallpaper /t REG_SZ /d "<path>" /f`
+   * is how the engine's `FileUtilsOS.setWallpaperFromPath()` repaints the
+   * Windows desktop. The Android equivalent is the host's `WallpaperManager`,
+   * which takes the image as base64.
+   */
+  function setWallpaperFromCommand(text) {
+    var m = /\/d\s+"([^"]*)"/.exec(text);
+    if (!m) return;
+    var b64 = hostCall('readBase64', resolvePath(m[1]));
+    if (typeof b64 === 'string' && b64.length > 0) hostCall('setWallpaper', b64);
+  }
+
+  /**
+   * Run one Windows command line, perform its Android side effect, and return
+   * the ASCII stdout the engine expects (`''` for side-effect-only commands).
+   *
+   * Only the commands the engine is *observed* to run are listed; everything
+   * else falls through to `host.log()` so an unexpected command is visible
+   * instead of silent.
+   */
+  function runCommand(command) {
+    var text = String(command == null ? '' : command);
+    var lower = text.toLowerCase();
+
+    // "read the player's real account name" — the first Meta performance.
+    // `W26_WindowsFullName.fullName` takes line 2 of the output, so the shape
+    // has to stay wmic-like. ASCII only: the engine GBK-decodes this buffer.
+    if (lower.indexOf('wmic useraccount') !== -1) {
+      return 'FullName\n\n' + asciiOnly(hostString('deviceName'));
+    }
+
+    // "read the Windows version" — also GBK-decoded, so ASCII only.
+    if (lower.indexOf('wmic os get caption') !== -1) {
+      return 'Android ' + asciiOnly(hostString('androidVersion'));
+    }
+
+    // `net user %username%` is the second "real name" performance
+    // (`W26_VisualSysOpt.getWindowsFullName`). It reads line 2, drops the first
+    // token, re-joins the rest with single spaces and then cuts the last two
+    // characters — so the line needs a one-word label, and exactly one trailing
+    // space, for the name to come back out whole.
+    if (/(^|\s)net user(\s|$)/.test(lower)) {
+      return '\n\nUser ' + asciiOnly(hostString('deviceName')) + ' ';
+    }
+
+    // "change the desktop wallpaper".
+    if (lower.indexOf('reg add') !== -1 && lower.indexOf('wallpaper') !== -1) {
+      setWallpaperFromCommand(text);
+      return '';
+    }
+
+    // "shut down the computer": the full game runs `nircmd.exe shutdown`, this
+    // Demo build's power-off command is `nircmd.exe hibernate` (customCommand_15033).
+    // Either way Android plays the black-screen performance and quits the app —
+    // it never really powers the device off.
+    if (lower.indexOf('nircmd') !== -1 && /shutdown|hibernate|exitwin|poweroff/.test(lower)) {
+      hostCall('fakeShutdown');
+      return '';
+    }
+
+    // "pop a tray balloon", and the nircmd message boxes: a toast/notification.
+    if (lower.indexOf('trayballoon') !== -1 ||
+      (lower.indexOf('nircmd') !== -1 &&
+        (lower.indexOf('"infobox"') !== -1 || lower.indexOf('"qboxcom"') !== -1))) {
+      hostCall('toast', popupMessage(quotedArgs(text)));
+      return '';
+    }
+
+    // Everything else is Windows-only plumbing: the wmic system-info queries
+    // behind the trace console, nvidia-smi, rundll32, and scrnsave (the
+    // "switch the monitor off" performance, which has no host capability yet).
+    hostCall('log', text);
+    return '';
+  }
+
+  /** True when the engine asked for raw bytes (`{encoding: 'buffer'}`). */
+  function wantsBuffer(options) {
+    var enc = parseEncoding(options);
+    return typeof enc === 'string' && enc.toLowerCase() === 'buffer';
+  }
+
+  /**
+   * The object `spawn()` returns. The engine only calls `ps.on('close', …)`,
+   * which must fire or the waiting command never resumes.
+   */
+  function makeChildProcess() {
+    var child = {
+      on: function (event, listener) {
+        var name = String(event);
+        if ((name === 'close' || name === 'exit') && typeof listener === 'function') {
+          defer(function () { listener(0); });
+        }
+        return child;
+      }
+    };
+    return child;
+  }
+
+  var childProcessModule = {
+    // `execSync(cmd)` → String; `execSync(cmd, {encoding:'buffer'})` → bytes.
+    execSync: function (command, options) {
+      var out = runCommand(command);
+      return wantsBuffer(options) ? asciiEncode(out) : out;
+    },
+
+    // Node's `(error, stdout, stderr)` callback, always delivered
+    // asynchronously — the engine drives a SyncTask off it. The side effect
+    // itself happens now, so an `exec()` without a callback still lands.
+    exec: function (command, options, callback) {
+      if (typeof options === 'function') { callback = options; options = undefined; }
+      var out = runCommand(command);
+      var stdout = wantsBuffer(options) ? asciiEncode(out) : out;
+      if (typeof callback === 'function') {
+        defer(function () { callback(null, stdout, ''); });
+      }
+      return undefined;
+    },
+
+    spawn: function (command, args) {
+      var text = String(command == null ? '' : command);
+      if (/messageshow/i.test(text)) {
+        // `W26_MessageShow` runs MessageShow.exe for a Windows message box; the
+        // Android equivalent is a notification.
+        hostCall('toast', popupMessage(Array.isArray(args) ? args : []));
+      } else {
+        hostCall('log', text);
+      }
+      return makeChildProcess();
+    }
+  };
+
+  /* --- `nw.gui` ------------------------------------------------------ */
+
+  /**
+   * The pseudo-window `nw.Window.get()` returns. The engine calls it
+   * unconditionally at boot (`os._win = gcTop.require('nw.gui').Window.get()`)
+   * and drives it from `SSZYG_WinSetting` / `SSZYG_WinResizeMove` /
+   * `W26_VisualSysOpt`, so every member it touches must exist and must not
+   * throw. Android has no movable desktop window, so the controls are inert;
+   * only `close()` has a real meaning — the engine's "quit the game", which
+   * the host implements as the shutdown performance followed by `finish()`.
+   */
+  function makeWindow() {
+    var noop = function () {};
+    return {
+      x: 0,
+      y: 0,
+      width: 0,
+      height: 0,
+      close: function () { hostCall('fakeShutdown'); },
+      show: noop,
+      hide: noop,
+      moveTo: noop,
+      resizeTo: noop,
+      minimize: noop,
+      maximize: noop,
+      restore: noop,
+      setResizable: noop,
+      setAlwaysOnTop: noop,
+      setMaximumSize: noop,
+      setMinimumSize: noop,
+      enterFullscreen: noop,
+      leaveFullscreen: noop,
+      getPrinters: function (cb) {
+        if (typeof cb === 'function') defer(function () { cb([]); });
+      },
+      print: function (options, cb) {
+        if (typeof cb === 'function') defer(function () { cb(); });
+      },
+      on: function () { return this; }
+    };
+  }
+
+  /** `nw.Clipboard.get()`: the engine reads and writes `'text'`. */
+  function makeClipboard() {
+    return {
+      get: function (type) {
+        if (type === undefined || type === 'text') return hostString('clipboardGet');
+        return '';
+      },
+      set: function (data, type) {
+        if (type === undefined || type === 'text') {
+          hostCall('clipboardSet', String(data == null ? '' : data));
+        }
+        return undefined;
+      }
+    };
+  }
+
+  var nwGuiModule = {
+    Window: { get: makeWindow },
+    Clipboard: { get: makeClipboard },
+    Shell: {
+      // `nw.Shell.openItem(path)` → the Android "open this file" Intent.
+      openItem: function (p) {
+        return hostCall('openFile', String(p == null ? '' : p)) === true;
+      }
+    }
+  };
+
+  /* ------------------------------------------------------------------ *
    * `require` with a lazy no-op fallback
    * ------------------------------------------------------------------ */
 
@@ -1042,7 +1318,9 @@
     path: pathModule,
     os: osModule,
     process: processObject,
-    fs: fsModule
+    fs: fsModule,
+    child_process: childProcessModule,
+    'nw.gui': nwGuiModule
   };
 
   function requireModule(name) {
