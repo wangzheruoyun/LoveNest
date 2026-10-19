@@ -423,7 +423,16 @@ class MainActivity : Activity() {
             " audioEnded=" + payload.optLong("audioEnded", -1L) +
             " audioCtx=" + payload.optString("audioContexts").ifEmpty { "[]" } +
             " pend=" + payload.optLong("pend", -1L) +
-            " vis=" + payload.optString("visibility").ifEmpty { "unknown" }
+            " vis=" + payload.optString("visibility").ifEmpty { "unknown" } +
+            // Task 13: GL activity per frame, and the WebAudio clock, so the
+            // heartbeat itself distinguishes "painting black" from "not
+            // painting" and "silent" from "audio graph dead".
+            " draws=" + payload.optLong("draws", -1L) +
+            " clear=" + payload.optLong("clear", -1L) +
+            " texUp=" + payload.optLong("texUp", -1L) +
+            " readPx=" + payload.optLong("readPx", -1L) +
+            " absStart=" + payload.optLong("absStart", -1L) +
+            " ctxTime=" + payload.optDouble("ctxTime", -1.0)
 
     /**
      * H3 vs 甲/乙: once the engine has delivered a frame, three consecutive
@@ -455,6 +464,16 @@ class MainActivity : Activity() {
         if (!rafFiredSeen || rafStallSamples < STALL_SAMPLES || stallReported) return
         stallReported = true
         val counters = heartbeatCounters(payload) + " stalledSamples=" + rafStallSamples
+
+        // Task 13: arm a framebuffer sample as well. If the engine's rAF has
+        // genuinely frozen, the read will not run — the frozen `rafFired` in
+        // `counters` already says so — but a sample that does fire proves the
+        // engine was still drawing while the watchdog thought it had stalled.
+        try {
+            webView?.evaluateJavascript(SAMPLE_FB_STALL_JS, null)
+        } catch (_: Exception) {
+            // Observing must not interfere with the STALL record below.
+        }
 
         val view = webView ?: run {
             reportStall(log, now, counters, "no-webview")
@@ -914,6 +933,13 @@ class MainActivity : Activity() {
         val log = diag ?: return
         val view = webView ?: return
         log.log("DUMP source=volume-down")
+        // Task 13: arm a framebuffer sample; it runs inside the engine's next
+        // rAF frame and writes its own `FB sample …` line.
+        try {
+            view.evaluateJavascript(SAMPLE_FB_DUMP_JS, null)
+        } catch (_: Exception) {
+            // A missing sample must not stop the dump below.
+        }
         try {
             view.evaluateJavascript(DUMP_JS) { raw ->
                 val data = unwrapJsonString(raw)?.toString() ?: "null"
@@ -1139,6 +1165,36 @@ class MainActivity : Activity() {
                 if (window.__gcDiagDump) return window.__gcDiagDump();
               } catch (e) {}
               return null;
+            })();
+        """
+
+        /**
+         * Task 13: arm a framebuffer sample. The page only sets a flag here;
+         * the `readPixels` grid runs inside the engine's next requestAnimation-
+         * Frame callback and writes its own `FB sample …` line (see
+         * `diagRunCanvasSample` in the shim for why a timer must not read).
+         */
+        const val SAMPLE_FB_STALL_JS = """
+            (function () {
+              try {
+                if (window.__gcDiagSampleCanvas) {
+                  window.__gcDiagSampleCanvas('stall');
+                  return true;
+                }
+              } catch (e) {}
+              return false;
+            })();
+        """
+
+        const val SAMPLE_FB_DUMP_JS = """
+            (function () {
+              try {
+                if (window.__gcDiagSampleCanvas) {
+                  window.__gcDiagSampleCanvas('volume-down');
+                  return true;
+                }
+              } catch (e) {}
+              return false;
             })();
         """
 

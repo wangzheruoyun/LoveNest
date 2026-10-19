@@ -70,3 +70,42 @@
 - [ ] 真机日志（待补：`NATIVE_HB` 表格 + `STALL` 记录）
 - [x] RED（`fail 10`，新测试打旧 shim）→ GREEN（`102/102`）（见 `task-12-report.md`）
 - [ ] CI run id（见 `task-12-report.md`）
+
+---
+
+# 黑屏诊断包 v3（Task 13）验收记录
+
+**状态：** 待真机一次往返取证 —— 本机无 Java / Android SDK / 模拟器，Kotlin 侧改动
+（v3 心跳字段、FB 采样触发）**只能由 CI 证明可编译**；页面侧探针（帧缓冲采样、绘制计数、
+WebAudio 存活、字节口径、挂起表修复）有本机 RED→GREEN 证据。
+
+## 产物
+
+| | |
+|---|---|
+| APK | `app-release.apk`（tag `v1.0.0-diag3`，`versionName=1.0.0-diag3`、`versionCode=2`，正式密钥签名，可原地覆盖 diag1/diag2） |
+| 日志落点 | `/storage/emulated/0/Documents/爱之巢-logs/session-<yyyyMMdd-HHmmss>.log`（不变） |
+| 决定性记录 | `FB sample …`（t+8/16/30 秒各一次，帧内采样）＋每条 `NATIVE_HB …` 的 `draws/clear/texUp/readPx/absStart/ctxTime` |
+
+## 复现步骤（真机）
+
+1. 覆盖安装 `v1.0.0-diag3` 的 `app-release.apk`（与已装版本同签名）。
+2. 启动游戏，点到标题界面、点一次出声音，等它进入「少女祈祷中」直到画面变黑。
+3. **什么都不要按**，至少等 35 秒 —— `FB sample` 会在 t+8/16/30 秒各落一条（心跳表每 2 秒一行）。
+4. 可选：按一次 **音量减** 立即 dump 并再触发一次采样；按一次 **音量加** 模拟一次 WebGL 上下文丢失（diag 构建专属）。
+5. 取出上表路径的日志。
+
+## 判定表（帧缓冲采样把结论钉死）
+
+| 观测 | 结论 |
+|---|---|
+| `FB sample … nonBlack=0` 且 `draws`/`clear` 在涨 | 引擎在画，但画出来就是黑（场景状态为空/无效） |
+| `FB sample … nonBlack>0`（mean/max 非零） | 引擎画对了，是合成/上屏那层没显示 |
+| `draws` 不涨（`FB sample` 的 pts/内容与上一帧一致或采样根本没落） | 引擎的渲染路径停了（不是 rAF 停） |
+| `ctxLost=true` 或 `glErr≠0` | 采样时刻上下文已丢 / GL 出错 |
+
+## 证据
+
+- [ ] 真机日志（待补：`FB sample` 序列 + `NATIVE_HB` 表格）
+- [x] RED（`pending-probe` 5 中 4 失败；`bridge.test.js` 5 失败，均打旧 shim）→ GREEN（`112/112`）（见 `task-13-report.md`）
+- [ ] CI run id（见 `task-13-report.md`）
