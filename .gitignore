@@ -9,9 +9,13 @@ build/
 .gradle/
 local.properties
 
-# Signing material must never be committed (see plan Task 8)
+# Signing material must never be committed (see plan Task 8). The release
+# keystore is PKCS#12 (openssl, not keytool), so *.p12 is the one that matters;
+# the rest are here so any future format is covered too.
 *.jks
 *.keystore
+*.p12
+keystore.properties
 
 # OS noise
 .DS_Store

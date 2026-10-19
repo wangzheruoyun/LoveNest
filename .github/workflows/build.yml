@@ -1,19 +1,29 @@
 name: Android CI
 
-# Task 8 will add the tag trigger that produces signed release APKs and GitHub
-# Releases. This task only needs the debug APK to prove the shell compiles and
-# ships on CI.
+# Trigger explicitly so a tag push and a branch push are distinguishable. A bare
+# `push:` used to fire on both, which would double-build a tag (Task 6 review).
 on:
   push:
+    branches: ['**']
+    tags: ['v*']
   pull_request:
 
 permissions:
   contents: read
 
+# One run per ref: a tag push and a branch push can never build the same ref at
+# once, and a superseded run is cancelled instead of queueing behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build debug APK
     runs-on: ubuntu-latest
+    # Tag pushes are handled by the `release` job below; this job must not also
+    # run for them.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
     steps:
       - name: Checkout
@@ -51,3 +61,72 @@ jobs:
           name: app-debug
           path: android-app/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+  release:
+    name: Build signed release APK
+    runs-on: ubuntu-latest
+    # Only a v* tag builds and publishes the installable artifact.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      # The keystore is stored base64-encoded in a secret and decoded here, so the
+      # raw file is never committed. Write it outside the checkout's app tree but
+      # still inside the workspace, and keep the path absolute for Gradle.
+      - name: Decode release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/signing"
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/signing/release.p12"
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/signing/release.p12" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        working-directory: android-app
+        # KEYSTORE_FILE was exported to the job environment by the decode step.
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: gradle assembleRelease --stacktrace
+
+      # Hard proof the artifact is really signed with the release key: an unsigned
+      # or debug-signed APK would silently install as the wrong app, which is worse
+      # than a failed build. apksigner ships with the runner's build-tools.
+      - name: Verify the release APK is signed
+        working-directory: android-app
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/release/app-release.apk
+          test -f "$APK" || { echo "::error::$APK was not produced (unsigned output?)"; exit 1; }
+          APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
+          "$APKSIGNER" verify --print-certs "$APK"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: 爱之巢 Demo V1.52 安卓移植版 ${{ github.ref_name }}
+          body: |
+            爱之巢 Demo V1.52 的 Android 移植版，已签名正式密钥，可直接安装。
+
+            - 安装包：`app-release.apk`（arm64-v8a，Android 8.0+）
+            - 本包不含任何游戏资源；安装后读取手机上的
+              `/storage/emulated/0/Download/爱之巢DemoV1.52/` 文件夹运行，游戏目录保持零改动。
+            - 首次启动需要授予「所有文件访问」权限。
+          files: android-app/app/build/outputs/apk/release/app-release.apk
+          fail_on_unmatched_files: true
