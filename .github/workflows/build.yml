@@ -124,9 +124,10 @@ jobs:
           body: |
             爱之巢 Demo V1.52 的 Android 移植版，已签名正式密钥，可直接安装。
 
-            - 安装包：`app-release.apk`（arm64-v8a，Android 8.0+）
-            - 本包不含任何游戏资源；安装后读取手机上的
-              `/storage/emulated/0/Download/爱之巢DemoV1.52/` 文件夹运行，游戏目录保持零改动。
+            - 安装包：`app-release.apk`（Android 8.0+，无需 native 库）
+            - 本包不含游戏素材；唯一的例外是启动器图标，取自游戏自带的
+              `asset/image/icon/图标.png`。游戏本体仍是读取手机上的
+              `/storage/emulated/0/Download/爱之巢DemoV1.52/` 运行，该目录保持零改动。
             - 首次启动需要授予「所有文件访问」权限。
           files: android-app/app/build/outputs/apk/release/app-release.apk
           fail_on_unmatched_files: true
