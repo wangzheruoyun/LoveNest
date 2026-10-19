@@ -6,8 +6,11 @@ const { createHost } = require('./host-native');
 
 const GAME_ROOT = '/storage/emulated/0/Download/爱之巢DemoV1.52';
 
-function loadBridge(host) {
+function loadBridge(host, windowProps) {
   const sandbox = { window: {}, console, __GCNative: host, setTimeout, clearTimeout, Date, JSON, Math };
+  // Optional extra `window` properties (Task 11 uses this to set `__gcDiag`).
+  // Kept opt-in so the 85 pre-existing call sites are unaffected.
+  if (windowProps) Object.assign(sandbox.window, windowProps);
   sandbox.window.window = sandbox.window;
   sandbox.globalThis = sandbox.window;
   vm.createContext(sandbox);
@@ -1033,4 +1036,133 @@ test('引擎改壁纸后缓存失效，下一次读取重新取图（不得沿�
   assert.strictEqual(fsShim.readFileSync(file, { encoding: null }).toString('base64'), after,
     '改壁纸后必须重新取图，不得沿用改前那张');
   assert.strictEqual(asked, 2, '缓存必须已失效');
+});
+
+/* ------------------------------------------------------------------ *
+ * Task 11 — black-screen diagnostics (`window.__gcDiag`)
+ *
+ * Instrumentation only: these tests pin that the funnel emits *nothing*
+ * diagnostic when the flag is absent (the shipped behaviour), and emits the
+ * `CALL` / `DONE` pair with correct byte counts when the Activity opted in.
+ * ------------------------------------------------------------------ */
+
+const DIAG_LINE = /^(CALL|DONE|BIG|JSERR|JSREJECT|DIAG) /;
+
+/** Point `host.log` at an array; returns that array. */
+function diagLines(host) {
+  const lines = [];
+  host.log = (s) => { lines.push(String(s)); };
+  return lines;
+}
+
+test('__gcDiag 关闭时 hostCall 不产生任何诊断行（出厂行为不变）', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const w = loadBridge(host); // no windowProps: __gcDiag is absent, exactly as shipped
+  const fsShim = w.require('fs');
+  assert.strictEqual(fsShim.existsSync(GAME_ROOT + '/index.html'), true);
+  assert.ok(fsShim.readFileSync(GAME_ROOT + '/index.html').length > 0);
+  assert.deepStrictEqual(lines.filter((s) => DIAG_LINE.test(s)), [],
+    '开关关闭时不得出现任何 CALL/DONE/BIG/JSERR 行');
+});
+
+test('__gcDiag 开启时 readBase64 输出 CALL/DONE，且字节数取自实际载荷', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const w = loadBridge(host, { __gcDiag: true });
+  const file = GAME_ROOT + '/index.html';
+  const bytes = w.require('fs').readFileSync(file); // 无 options → 原始字节
+  const b64Len = Buffer.from(bytes).toString('base64').length;
+
+  const call = lines.filter((s) => s.indexOf('CALL ') === 0);
+  const done = lines.filter((s) => s.indexOf('DONE ') === 0);
+  assert.deepStrictEqual(call, ['CALL readBase64 args=' + file.length],
+    'CALL 必须紧贴宿主调用之前，args 为该路径的字符数');
+  assert.strictEqual(done.length, 1);
+  // ms 是墙钟差值，不稳定；固定其余字段后逐一比对。
+  assert.strictEqual(done[0].replace(/ ms=\d+$/, ' ms=N'),
+    'DONE readBase64 ok=true ret=' + b64Len + ' ms=N',
+    'ret 必须是宿主真正返回的 base64 字符数');
+});
+
+test('__gcDiag 开启时缺失方法记 err=missing，宿主抛异常记 err=throw', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const w = loadBridge(host, { __gcDiag: true });
+
+  // nw.Shell.openItem → hostCall('openFile', …); delete it to model an older host.
+  delete host.openFile;
+  assert.strictEqual(w.require('nw.gui').Shell.openItem(GAME_ROOT + '/index.html'), false);
+  assert.ok(lines.some((s) => /^DONE openFile ok=false .*err=missing$/.test(s)),
+    '缺失的宿主方法必须显式记 err=missing，而不是静默 undefined');
+
+  // A host that throws must be visible too (the funnel still absorbs it).
+  host.exists = () => { throw new Error('boom'); };
+  assert.strictEqual(w.require('fs').existsSync(GAME_ROOT + '/index.html'), false);
+  assert.ok(lines.some((s) => /^DONE exists ok=false .*err=throw$/.test(s)),
+    '宿主抛异常必须记 err=throw');
+});
+
+test('超过 4 MB 的载荷在参数方向与返回方向都告警', () => {
+  const docs = '/tmp/d';
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: docs });
+  const lines = diagLines(host);
+  const w = loadBridge(host, { __gcDiag: true });
+  const fsShim = w.require('fs');
+  const big = 'A'.repeat(4 * 1024 * 1024 + 1);
+
+  // 返回方向：宿主交回一个 >4 MB 的字符串。
+  host.readBase64 = () => big;
+  fsShim.readFileSync(GAME_ROOT + '/icon.png');
+  const ret = lines.filter((s) => /^BIG readBase64 dir=ret /.test(s));
+  assert.strictEqual(ret.length, 1, '返回方向必须恰好告警一次');
+  assert.strictEqual(ret[0], 'BIG readBase64 dir=ret bytes=' + big.length);
+
+  // 参数方向：引擎把 >4 MB 的 base64 交给宿主写入。
+  lines.length = 0;
+  host.writeBase64 = () => true;
+  fsShim.writeFileSync(docs + '/big.bin', big);
+  const abs = w.__gcBridge.resolvePath(docs + '/big.bin');
+  const b64Len = Math.ceil(big.length / 3) * 4; // 'A' 的 UTF-8 编码仍是单字节
+  const args = lines.filter((s) => /^BIG writeBase64 dir=args /.test(s));
+  assert.strictEqual(args.length, 1, '参数方向必须恰好告警一次');
+  assert.strictEqual(args[0], 'BIG writeBase64 dir=args bytes=' + (abs.length + b64Len));
+});
+
+test('__gcDiag 开启时安装页面心跳与 error/unhandledrejection 监听', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const timers = [];
+  const handlers = {};
+  const w = loadBridge(host, {
+    __gcDiag: true,
+    setInterval: (fn) => { timers.push(fn); return timers.length; },
+    addEventListener: (type, fn) => { handlers[type] = fn; }
+  });
+
+  assert.strictEqual(typeof timers[0], 'function', '必须注册 250ms 心跳定时器');
+  assert.strictEqual(w.__gcHeartbeat, 0);
+  timers[0]();
+  timers[0]();
+  assert.strictEqual(w.__gcHeartbeat, 2, '心跳必须每次 +1');
+
+  handlers.error({ message: 'boom', filename: 'a.js', lineno: 7, colno: 9 });
+  assert.strictEqual(lines[lines.length - 1], 'JSERR boom @ a.js:7:9');
+  handlers.unhandledrejection({ reason: { message: 'nope' } });
+  assert.strictEqual(lines[lines.length - 1], 'JSREJECT nope');
+});
+
+test('__gcDiag 关闭时不安装心跳、不注册监听（只能观测，不能改变行为）', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const timers = [];
+  let listeners = 0;
+  const w = loadBridge(host, {
+    setInterval: (fn) => { timers.push(fn); return timers.length; },
+    addEventListener: () => { listeners++; }
+  });
+  assert.strictEqual(timers.length, 0, '关闭时不得启动心跳');
+  assert.strictEqual(listeners, 0, '关闭时不得注册错误监听');
+  assert.strictEqual(typeof w.__gcHeartbeat, 'undefined');
+  assert.deepStrictEqual(lines.filter((s) => DIAG_LINE.test(s)), []);
 });

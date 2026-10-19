@@ -29,4 +29,13 @@
     <string name="exit_confirm_message">确定要退出《爱之巢》吗？未保存的进度可能会丢失。</string>
     <string name="exit_confirm_exit">退出</string>
     <string name="exit_confirm_cancel">取消</string>
+
+    <!--
+      Task 11: the renderer-death verdict. Reported for the diagnostic run; it
+      is also the only in-app recovery from a dead renderer, which is otherwise
+      a permanently black screen until the app is killed.
+    -->
+    <string name="renderer_gone_title">渲染进程已崩溃 / renderer process died</string>
+    <string name="renderer_gone_message">游戏的渲染进程已崩溃，画面因此变黑。诊断日志已保存。\n\nThe renderer process died, which is why the screen is black. A diagnostic log has been saved. Reload to continue playing.</string>
+    <string name="renderer_gone_reload">重新加载</string>
 </resources>

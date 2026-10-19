@@ -14,6 +14,7 @@ import android.graphics.Color
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.Settings
@@ -65,6 +66,13 @@ class GameBridge(
     private val activity: Activity,
     gameRoot: String,
     docsRoot: String,
+    /**
+     * The Task 11 diagnostic sink. `null` when no diagnostic session is
+     * running, in which case every `diag?.log(...)` below is a no-op and the
+     * bridge behaves exactly as it did before Task 11. It never affects the
+     * value a member returns.
+     */
+    private val diag: Diag? = null,
 ) {
 
     private val game = DirectFileSource(File(gameRoot))
@@ -78,6 +86,16 @@ class GameBridge(
     private val paths = RootedPathAuthority(game, docs)
 
     private val main = Handler(Looper.getMainLooper())
+
+    /**
+     * The host member currently executing on the WebView's JavaBridge thread, or
+     * `null`. Set by [tracked] around every `@JavascriptInterface` body and read
+     * by the main-thread watchdog, which is the only way to name a call the JS
+     * thread is parked inside: while a member runs, the JS thread cannot report
+     * anything more, and the missing `DONE` line alone does not say *which*
+     * member. Format: `"<name> <SystemClock.elapsedRealtime()>"`.
+     */
+    private val inFlight = AtomicReference<String?>(null)
 
     /**
      * True between [screenOff] and the next [restoreScreenBrightness], so the
@@ -103,23 +121,23 @@ class GameBridge(
 
     /** Absolute game root, no trailing slash. */
     @JavascriptInterface
-    fun gameRoot(): String = game.root()
+    fun gameRoot(): String = tracked("gameRoot") { game.root() }
 
     /** Absolute documents root the engine treats as `os.homedir()`, no trailing slash. */
     @JavascriptInterface
-    fun docsRoot(): String = docs.root()
+    fun docsRoot(): String = tracked("docsRoot") { docs.root() }
 
     /* ------------------------------------------------------------------ *
      * Filesystem
      * ------------------------------------------------------------------ */
 
     @JavascriptInterface
-    fun exists(path: String?): Boolean = resolve(path)?.exists() ?: false
+    fun exists(path: String?): Boolean = tracked("exists") { resolve(path)?.exists() ?: false }
 
     @JavascriptInterface
-    fun stat(path: String?): String? {
+    fun stat(path: String?): String? = tracked("stat") {
         val file = resolve(path) ?: return null
-        return try {
+        try {
             if (!file.exists()) return null
             "{\"isDirectory\":${file.isDirectory},\"size\":${file.length()}}"
         } catch (_: Exception) {
@@ -128,17 +146,17 @@ class GameBridge(
     }
 
     @JavascriptInterface
-    fun readBase64(path: String?): String? {
+    fun readBase64(path: String?): String? = tracked("readBase64") {
         val file = resolve(path) ?: return null
         if (!file.isFile) return null
-        return Base64Stream.encode(file)
+        Base64Stream.encode(file)
     }
 
     @JavascriptInterface
-    fun writeBase64(path: String?, b64: String?): Boolean {
+    fun writeBase64(path: String?, b64: String?): Boolean = tracked("writeBase64") {
         val file = resolve(path) ?: return false
         val bytes = Base64Stream.decode(b64 ?: return false) ?: return false
-        return try {
+        try {
             file.parentFile?.mkdirs()
             file.outputStream().use { it.write(bytes) }
             true
@@ -148,13 +166,13 @@ class GameBridge(
     }
 
     @JavascriptInterface
-    fun readDir(path: String?): String {
+    fun readDir(path: String?): String = tracked("readDir") {
         val entries = try {
             resolve(path)?.list()
         } catch (_: Exception) {
             null
         } ?: return "[]"
-        return try {
+        try {
             val array = JSONArray()
             for (entry in entries) array.put(entry as Any)
             array.toString()
@@ -164,9 +182,9 @@ class GameBridge(
     }
 
     @JavascriptInterface
-    fun mkdirp(path: String?): Boolean {
+    fun mkdirp(path: String?): Boolean = tracked("mkdirp") {
         val file = resolve(path) ?: return false
-        return try {
+        try {
             file.isDirectory || file.mkdirs()
         } catch (_: Exception) {
             false
@@ -174,9 +192,9 @@ class GameBridge(
     }
 
     @JavascriptInterface
-    fun unlink(path: String?): Boolean {
+    fun unlink(path: String?): Boolean = tracked("unlink") {
         val file = resolve(path) ?: return false
-        return try {
+        try {
             // `File.delete()` happily removes an empty directory; Node's
             // unlinkSync refuses one with EISDIR, so refuse it here too.
             if (file.isDirectory) false else file.delete()
@@ -186,10 +204,10 @@ class GameBridge(
     }
 
     @JavascriptInterface
-    fun rename(path: String?, toPath: String?): Boolean {
+    fun rename(path: String?, toPath: String?): Boolean = tracked("rename") {
         val from = resolve(path) ?: return false
         val to = resolve(toPath) ?: return false
-        return try {
+        try {
             from.renameTo(to)
         } catch (_: Exception) {
             false
@@ -197,9 +215,9 @@ class GameBridge(
     }
 
     @JavascriptInterface
-    fun rmdir(path: String?): Boolean {
+    fun rmdir(path: String?): Boolean = tracked("rmdir") {
         val file = resolve(path) ?: return false
-        return try {
+        try {
             // `delete()` on a non-empty directory fails, like Node's rmdirSync.
             if (!file.isDirectory) false else file.delete()
         } catch (_: Exception) {
@@ -222,25 +240,25 @@ class GameBridge(
      * through a GBK path.
      */
     @JavascriptInterface
-    fun deviceName(): String {
+    fun deviceName(): String = tracked("deviceName") {
         val configured = try {
             Settings.Global.getString(activity.contentResolver, Settings.Global.DEVICE_NAME)
         } catch (_: Exception) {
             null
         }
         val name = configured?.takeIf { it.isNotBlank() } ?: (Build.MODEL ?: "")
-        return asciiOnly(name)
+        asciiOnly(name)
     }
 
     /** `Android <release>`, ASCII-only, standing in for `wmic os get Caption`. */
     @JavascriptInterface
-    fun androidVersion(): String = asciiOnly(Build.VERSION.RELEASE ?: "")
+    fun androidVersion(): String = tracked("androidVersion") { asciiOnly(Build.VERSION.RELEASE ?: "") }
 
     /** Stand-in for `W26_DesktopWallpaper`: a real wallpaper change. */
     @JavascriptInterface
-    fun setWallpaper(b64: String?): Boolean {
+    fun setWallpaper(b64: String?): Boolean = tracked("setWallpaper") {
         val bytes = Base64Stream.decode(b64 ?: return false) ?: return false
-        return try {
+        try {
             val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return false
             WallpaperManager.getInstance(activity).setBitmap(bitmap)
             true
@@ -261,8 +279,8 @@ class GameBridge(
      * PNG, which is what the engine's `data:image/png;base64,…` expects.
      */
     @JavascriptInterface
-    fun getWallpaper(): String? {
-        return try {
+    fun getWallpaper(): String? = tracked("getWallpaper") {
+        try {
             val drawable = WallpaperManager.getInstance(activity).drawable ?: return null
             val width = drawable.intrinsicWidth
             val height = drawable.intrinsicHeight
@@ -290,7 +308,7 @@ class GameBridge(
      * hang the game. A main-thread call returns `false` rather than deadlocking.
      */
     @JavascriptInterface
-    fun confirm(title: String?, body: String?): Boolean {
+    fun confirm(title: String?, body: String?): Boolean = tracked("confirm") {
         if (Looper.myLooper() == Looper.getMainLooper()) return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
@@ -342,9 +360,12 @@ class GameBridge(
                     // Already gone.
                 }
             }
+            diag?.log("CONFIRM answered=false timedOut=true")
             return false
         }
-        return yes.get()
+        val answer = yes.get()
+        diag?.log("CONFIRM answered=$answer")
+        answer
     }
 
     /**
@@ -359,22 +380,28 @@ class GameBridge(
      */
     @JavascriptInterface
     fun screenOff() {
-        screenDimmed.set(true)
-        main.post {
-            // A restore (touch / pause) may have been queued before this ran and
-            // already cancelled the dimming; honour that rather than re-dim.
-            if (!screenDimmed.get()) return@post
-            try {
-                val attributes = activity.window.attributes
-                attributes.screenBrightness = 0f
-                activity.window.attributes = attributes
-            } catch (_: Exception) {
-                // A window that refuses the override is not worth failing the game for.
+        tracked("screenOff") {
+            // H4 evidence: if the log's last brightness line is `0` and no
+            // restore follows, a "false black screen" is still on the table; if
+            // brightness never drops, H4 is excluded outright.
+            diag?.log("BRIGHTNESS 0 source=offMonitor")
+            screenDimmed.set(true)
+            main.post {
+                // A restore (touch / pause) may have been queued before this ran and
+                // already cancelled the dimming; honour that rather than re-dim.
+                if (!screenDimmed.get()) return@post
+                try {
+                    val attributes = activity.window.attributes
+                    attributes.screenBrightness = 0f
+                    activity.window.attributes = attributes
+                } catch (_: Exception) {
+                    // A window that refuses the override is not worth failing the game for.
+                }
             }
+            // Safety net: the original ends on the next input, but a player who
+            // never touches the screen must not be left staring at black forever.
+            main.postDelayed({ restoreScreenBrightness() }, SCREEN_OFF_BACKSTOP_MS)
         }
-        // Safety net: the original ends on the next input, but a player who
-        // never touches the screen must not be left staring at black forever.
-        main.postDelayed({ restoreScreenBrightness() }, SCREEN_OFF_BACKSTOP_MS)
     }
 
     /**
@@ -386,6 +413,7 @@ class GameBridge(
      */
     fun restoreScreenBrightness() {
         if (!screenDimmed.getAndSet(false)) return
+        diag?.log("BRIGHTNESS none source=restore")
         main.post {
             try {
                 val attributes = activity.window.attributes
@@ -402,12 +430,14 @@ class GameBridge(
     /** Stand-in for `nircmd trayballoon`. */
     @JavascriptInterface
     fun toast(msg: String?) {
-        val text = msg ?: return
-        main.post {
-            try {
-                Toast.makeText(activity, text, Toast.LENGTH_SHORT).show()
-            } catch (_: Exception) {
-                // A toast that cannot be shown is not worth failing the game for.
+        tracked("toast") {
+            val text = msg ?: return
+            main.post {
+                try {
+                    Toast.makeText(activity, text, Toast.LENGTH_SHORT).show()
+                } catch (_: Exception) {
+                    // A toast that cannot be shown is not worth failing the game for.
+                }
             }
         }
     }
@@ -420,24 +450,29 @@ class GameBridge(
      */
     @JavascriptInterface
     fun fakeShutdown() {
-        main.post {
-            try {
-                val overlay = View(activity).apply { setBackgroundColor(Color.BLACK) }
-                (activity.window.decorView as ViewGroup).addView(
-                    overlay,
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                )
-            } catch (_: Exception) {
-                // Without the overlay the app still exits below.
-            }
-            main.postDelayed({
+        tracked("fakeShutdown") {
+            // An engine-initiated black screen would masquerade as the bug, so
+            // the log must name it.
+            diag?.log("SHUTDOWN overlay requested by the engine")
+            main.post {
                 try {
-                    activity.finish()
+                    val overlay = View(activity).apply { setBackgroundColor(Color.BLACK) }
+                    (activity.window.decorView as ViewGroup).addView(
+                        overlay,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                    )
                 } catch (_: Exception) {
-                    // Already finishing.
+                    // Without the overlay the app still exits below.
                 }
-            }, SHUTDOWN_BLACKOUT_MS)
+                main.postDelayed({
+                    try {
+                        activity.finish()
+                    } catch (_: Exception) {
+                        // Already finishing.
+                    }
+                }, SHUTDOWN_BLACKOUT_MS)
+            }
         }
     }
 
@@ -454,9 +489,9 @@ class GameBridge(
      * not open".
      */
     @JavascriptInterface
-    fun openFile(path: String?): Boolean {
+    fun openFile(path: String?): Boolean = tracked("openFile") {
         val file = resolve(path) ?: return false
-        return try {
+        try {
             if (!file.exists()) return false
             val uri = FileProvider.getUriForFile(activity, fileProviderAuthority(), file)
             activity.startActivity(
@@ -475,46 +510,61 @@ class GameBridge(
     /** Vibration for the Meta performances (`navigator.vibrate` on platform 4). */
     @JavascriptInterface
     fun vibrate(ms: Long) {
-        try {
-            val vibrator = activity.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
-            if (!vibrator.hasVibrator()) return
-            vibrator.vibrate(
-                VibrationEffect.createOneShot(ms.coerceIn(1L, MAX_VIBRATION_MS), VibrationEffect.DEFAULT_AMPLITUDE)
-            )
-        } catch (_: Exception) {
-            // Missing VIBRATE grant or a device without a vibrator.
-        }
-    }
-
-    @JavascriptInterface
-    fun clipboardGet(): String = try {
-        val manager = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-        val clip = manager?.primaryClip
-        if (clip == null || clip.itemCount == 0) "" else clip.getItemAt(0).coerceToText(activity).toString()
-    } catch (_: Exception) {
-        ""
-    }
-
-    @JavascriptInterface
-    fun clipboardSet(s: String?) {
-        val text = s ?: return
-        main.post {
+        tracked("vibrate") {
             try {
-                val manager = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                manager?.setPrimaryClip(ClipData.newPlainText(CLIP_LABEL, text))
+                val vibrator = activity.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
+                if (!vibrator.hasVibrator()) return
+                vibrator.vibrate(
+                    VibrationEffect.createOneShot(ms.coerceIn(1L, MAX_VIBRATION_MS), VibrationEffect.DEFAULT_AMPLITUDE)
+                )
             } catch (_: Exception) {
-                // Clipboard write refused; nothing to do.
+                // Missing VIBRATE grant or a device without a vibrator.
             }
         }
     }
 
     @JavascriptInterface
+    fun clipboardGet(): String = tracked("clipboardGet") {
+        try {
+            val manager = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            val clip = manager?.primaryClip
+            if (clip == null || clip.itemCount == 0) "" else clip.getItemAt(0).coerceToText(activity).toString()
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    @JavascriptInterface
+    fun clipboardSet(s: String?) {
+        tracked("clipboardSet") {
+            val text = s ?: return
+            main.post {
+                try {
+                    val manager = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    manager?.setPrimaryClip(ClipData.newPlainText(CLIP_LABEL, text))
+                } catch (_: Exception) {
+                    // Clipboard write refused; nothing to do.
+                }
+            }
+        }
+    }
+
+    /**
+     * The shim's `host.log` sink — and, during a diagnostic run, the single
+     * funnel that puts every page-side line on disk. `Diag.log` is
+     * line-flushed, so a `CALL` line written by the shim is durable before the
+     * host call it precedes begins.
+     */
+    @JavascriptInterface
     fun log(s: String?) {
-        val text = s ?: ""
-        // Ruling D: a failed asset probe means the page cannot reach its own
-        // game files, which is the one failure that must not hide. Everything
-        // else the engine logs is informational.
-        if (text.startsWith(PROBE_FAILURE_PREFIX)) Log.e(TAG, text) else Log.d(TAG, text)
+        tracked("log") {
+            val text = s ?: ""
+            // Ruling D: a failed asset probe means the page cannot reach its own
+            // game files, which is the one failure that must not hide. Everything
+            // else the engine logs is informational.
+            if (text.startsWith(PROBE_FAILURE_PREFIX)) Log.e(TAG, text) else Log.d(TAG, text)
+            diag?.log(text)
+        }
     }
 
     /* ------------------------------------------------------------------ *
@@ -528,6 +578,30 @@ class GameBridge(
      * [RootedPathAuthority], which is unit-tested.
      */
     private fun resolve(path: String?): File? = paths.resolveFile(path)
+
+    /**
+     * Mark [name] as the call in flight for the duration of [body], so the
+     * main-thread watchdog can name a member the JS thread is parked inside.
+     *
+     * `tracked` is `inline`, so a `return` in a member body exits that member
+     * directly and the `finally` below still clears the marker; the marker is
+     * therefore never left set by a normal return. It is also the reason this
+     * adds no allocation or exception surface of its own.
+     */
+    private inline fun <T> tracked(name: String, body: () -> T): T {
+        inFlight.set("$name ${SystemClock.elapsedRealtime()}")
+        try {
+            return body()
+        } finally {
+            inFlight.set(null)
+        }
+    }
+
+    /**
+     * `"<member> <startRealtimeMs>"` for the member the JavaBridge thread is
+     * currently inside, or `null`. Read from the main thread by the watchdog.
+     */
+    fun inFlightDescription(): String? = inFlight.get()
 
     /** Non-ASCII becomes `?`, exactly as the shim's own `asciiOnly` does. */
     private fun asciiOnly(value: String?): String {

@@ -792,6 +792,133 @@
     return err;
   }
 
+  /* ------------------------------------------------------------------ *
+   * Diagnostics — instrumentation only, gated on `window.__gcDiag`
+   *
+   * Nothing in this block runs unless the host Activity sets
+   * `window.__gcDiag = true` before the page loads. That is the whole safety
+   * property: the shipped shim (flag absent) behaves exactly as it did before
+   * these lines existed, and a `__gcDiag` run differs only by log output.
+   * ------------------------------------------------------------------ */
+
+  /** A payload larger than this is worth a warning line, either direction. */
+  var DIAG_BIG_BYTES = 4 * 1024 * 1024;
+
+  /** True only when the Activity opted in before load. Never cached. */
+  function diagEnabled() {
+    try {
+      return !!(win && win.__gcDiag === true);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * Write one diagnostic line through the host's `log`. Calls the host member
+   * directly — *not* through `hostCall` — so diagnosing a call can never
+   * recurse into diagnosing the diagnosis. Never throws.
+   */
+  function diagWrite(line) {
+    if (!host || typeof host.log !== 'function') return;
+    try {
+      host.log(String(line));
+    } catch (e) {
+      // A host that cannot log must not break the call it was observing.
+    }
+  }
+
+  /**
+   * Payload size of one host argument or return value, in characters. Only
+   * strings carry a payload; `true`/`undefined` and friends count as zero.
+   */
+  function diagSize(value) {
+    return (typeof value === 'string') ? value.length : 0;
+  }
+
+  /** Emit the >4 MB warning for one direction of one call. */
+  function diagBig(name, dir, bytes) {
+    if (bytes > DIAG_BIG_BYTES) {
+      diagWrite('BIG ' + name + ' dir=' + dir + ' bytes=' + bytes);
+    }
+  }
+
+  /** Wall clock, in ms. Guarded because exotic hosts may lack `Date`. */
+  function diagNow() {
+    try {
+      return Date.now();
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  /**
+   * Install the page-side liveness probe, once, when the flag is set:
+   *
+   *  - `window.__gcHeartbeat++` every 250 ms, which the native watchdog polls
+   *    with `evaluateJavascript`. A heartbeat that keeps advancing while the
+   *    picture is frozen is H3 (the engine's own loop stopped); a heartbeat
+   *    that stops while the process lives is H1/H2.
+   *  - `error` / `unhandledrejection` listeners that log message, file, line
+   *    and column, so an exception that killed the engine's tick chain is on
+   *    disk rather than in a devtools console nobody can open.
+   */
+  function installDiagnostics() {
+    if (!diagEnabled()) return;
+
+    try {
+      if (typeof win.__gcHeartbeat === 'undefined') win.__gcHeartbeat = 0;
+    } catch (e) {
+      // A frozen window property is not worth failing the boot for.
+    }
+
+    try {
+      if (typeof win.setInterval === 'function') {
+        win.setInterval(function () {
+          try {
+            win.__gcHeartbeat = (win.__gcHeartbeat || 0) + 1;
+          } catch (e) {
+            // Ignore: the counter is best-effort.
+          }
+        }, 250);
+      }
+    } catch (e) {
+      // Without an interval the native side simply sees a constant heartbeat.
+    }
+
+    try {
+      if (win.addEventListener) {
+        win.addEventListener('error', function (event) {
+          var msg = 'unknown error';
+          var file = '';
+          var line = 0;
+          var col = 0;
+          try {
+            if (event) {
+              if (event.message !== undefined && event.message !== null) msg = String(event.message);
+              file = String(event.filename == null ? '' : event.filename);
+              line = event.lineno == null ? 0 : event.lineno;
+              col = event.colno == null ? 0 : event.colno;
+            }
+          } catch (e) {}
+          diagWrite('JSERR ' + msg + ' @ ' + file + ':' + line + ':' + col);
+        }, false);
+        win.addEventListener('unhandledrejection', function (event) {
+          var reason = '';
+          try {
+            var r = event ? event.reason : null;
+            if (r && r.message !== undefined) reason = String(r.message);
+            else if (r !== undefined && r !== null) reason = String(r);
+          } catch (e) {}
+          diagWrite('JSREJECT ' + reason);
+        }, false);
+      }
+    } catch (e) {
+      // A host without addEventListener gets no page-side error capture.
+    }
+
+    diagWrite('DIAG on heartbeat=250ms flag=__gcDiag');
+  }
+
   /**
    * Call a host method, absorbing any host-side throw into `undefined`.
    *
@@ -799,16 +926,63 @@
    * *and* parameter count, so calling a zero-argument host method with an
    * extra `undefined` would miss the binding and throw. The no-argument branch
    * below is therefore not cosmetic.
+   *
+   * ### Task 11 black-screen diagnostics
+   *
+   * When `window.__gcDiag === true` (set by `MainActivity` before the page
+   * loads), every host round trip is bracketed with two lines written straight
+   * to `host.log`:
+   *
+   *   CALL <name> args=<bytes>        — written *before* the host runs
+   *   DONE <name> ok=<bool> ret=<bytes> ms=<n>
+   *
+   * and a `BIG <name> dir=<args|ret> bytes=<n>` warning whenever one payload
+   * exceeds 4 MB. The point of writing `CALL` first is H2: if the JS thread
+   * parks inside a host call, the last line on disk is a `CALL` with no
+   * `DONE`, which names the blocking call without any further instrumentation.
+   *
+   * `args`/`ret` are payload lengths in characters. The payloads this bridge
+   * actually carries are POSIX paths and base64 blobs, both ASCII, so one
+   * character is one byte — and counting characters keeps the probe O(1)
+   * instead of walking a 32-million-character font string, i.e. it cannot
+   * itself perturb the timing it exists to measure.
+   *
+   * The flag is read on every call, never cached, and the whole block is a
+   * no-op when it is absent — the shipped shim is byte-for-byte the same code
+   * path.
    */
   function hostCall(name, arg1, arg2) {
-    if (!host || typeof host[name] !== 'function') return undefined;
-    try {
-      if (arguments.length <= 1) return host[name]();
-      if (arg2 === undefined) return host[name](arg1);
-      return host[name](arg1, arg2);
-    } catch (e) {
+    var diag = diagEnabled();
+    if (diag) {
+      var args = 0;
+      if (arguments.length > 1) args += diagSize(arg1);
+      if (arguments.length > 2) args += diagSize(arg2);
+      diagWrite('CALL ' + name + ' args=' + args);
+      diagBig(name, 'args', args);
+    }
+
+    if (!host || typeof host[name] !== 'function') {
+      if (diag) diagWrite('DONE ' + name + ' ok=false ret=0 ms=0 err=missing');
       return undefined;
     }
+
+    var started = diag ? diagNow() : 0;
+    var result;
+    try {
+      if (arguments.length <= 1) result = host[name]();
+      else if (arg2 === undefined) result = host[name](arg1);
+      else result = host[name](arg1, arg2);
+    } catch (e) {
+      if (diag) diagWrite('DONE ' + name + ' ok=false ret=0 ms=' + (diagNow() - started) + ' err=throw');
+      return undefined;
+    }
+
+    if (diag) {
+      var ret = diagSize(result);
+      diagWrite('DONE ' + name + ' ok=true ret=' + ret + ' ms=' + (diagNow() - started));
+      diagBig(name, 'ret', ret);
+    }
+    return result;
   }
 
   function isInsideRoot(abs, root) {
@@ -1856,5 +2030,8 @@
         configurable: false
       });
     }
+
+    // Task 11: page-side instrumentation, only when the Activity opted in.
+    installDiagnostics();
   }
 })();

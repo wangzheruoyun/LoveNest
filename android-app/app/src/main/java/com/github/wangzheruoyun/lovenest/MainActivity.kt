@@ -2,6 +2,7 @@ package com.github.wangzheruoyun.lovenest
 
 import android.Manifest
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.AlertDialog
 import android.content.ActivityNotFoundException
 import android.content.Intent
@@ -10,7 +11,11 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Debug
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
@@ -19,7 +24,11 @@ import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.webkit.ConsoleMessage
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -34,6 +43,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.SequenceInputStream
 import java.util.Collections
+import org.json.JSONObject
 
 /**
  * How `gc-bridge.js` gets in front of the engine.
@@ -87,8 +97,36 @@ class MainActivity : Activity() {
     private var bridgeFailureReported = false
     private var exitDialogShowing = false
 
+    /* ---- Task 11 diagnostics ------------------------------------------ */
+
+    /** The diagnostic session, or null if it could not be opened at all. */
+    private var diag: Diag? = null
+
+    /** Drives the heartbeat/watchdog tick; created lazily, stopped in onDestroy. */
+    private var watchdogHandler: Handler? = null
+
+    /** True while a heartbeat `evaluateJavascript` has been issued but not answered. */
+    private var heartbeatPending = false
+
+    /** When the outstanding heartbeat was issued, for the "missing" line's age. */
+    private var heartbeatSentAt = 0L
+
+    /** Ticks since the session started, so memory is sampled every 5s. */
+    private var watchdogTicks = 0
+
+    /** Set by `onRenderProcessGone`; read by the heartbeat line as H1 evidence. */
+    private var renderProcessGone = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Start the log before anything else, so the boot sequence is on disk
+        // even if the game never reaches its title screen.
+        diag = try {
+            Diag.start(this, GAME_ROOT, docsRootPath(), INJECTION_MODE.name)
+        } catch (_: Exception) {
+            null
+        }
+        diag?.log("LIFECYCLE created")
         buildUi()
         applyImmersive()
         updateGate()
@@ -187,6 +225,7 @@ class MainActivity : Activity() {
     private fun startGame() {
         if (gameStarted) return
         gameStarted = true
+        renderProcessGone = false
 
         val view = WebView(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -210,11 +249,12 @@ class MainActivity : Activity() {
 
             // The engine's Cordova-vibrate branch is unreachable on platform 2;
             // the shim routes what it can here instead.
-            val bridge = GameBridge(this@MainActivity, GAME_ROOT, docsRootPath())
+            val bridge = GameBridge(this@MainActivity, GAME_ROOT, docsRootPath(), diag)
             gameBridge = bridge
             addJavascriptInterface(bridge, JS_INTERFACE_NAME)
 
             webViewClient = GameWebViewClient()
+            webChromeClient = GameWebChromeClient()
         }
 
         webView = view
@@ -242,6 +282,193 @@ class MainActivity : Activity() {
                 gameIndexUrl(),   // history URL: the document's own URL
             )
         }
+
+        startWatchdog()
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Task 11 — native-side observation
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Start the main-thread watchdog: a 1 s tick that polls the page heartbeat
+     * every 2 s, names any `INFLIGHT` host call, and samples memory every 5 s.
+     * The main looper is demonstrably alive even when the picture is black (the
+     * back dialog still appears), so it is the one vantage point that survives
+     * whatever the page did. Idempotent, so renderer recovery can restart it.
+     */
+    private fun startWatchdog() {
+        if (diag == null) return
+        val handler = watchdogHandler ?: Handler(Looper.getMainLooper()).also { watchdogHandler = it }
+        handler.removeCallbacksAndMessages(null)
+        watchdogTicks = 0
+        heartbeatPending = false
+        handler.postDelayed(watchdogTick, WATCHDOG_INTERVAL_MS)
+    }
+
+    private fun stopWatchdog() {
+        watchdogHandler?.removeCallbacksAndMessages(null)
+    }
+
+    private val watchdogTick = object : Runnable {
+        override fun run() {
+            val log = diag ?: return
+            watchdogTicks++
+
+            if (watchdogTicks % HEARTBEAT_TICKS == 0) {
+                val now = System.currentTimeMillis()
+                // H2/H1 discriminator: is the renderer still answering at all?
+                if (heartbeatPending) {
+                    log.log(
+                        "NATIVE_HB t=$now cb=missing for=${SystemClock.elapsedRealtime() - heartbeatSentAt}ms " +
+                            "rendererAlive=${rendererAlive()}"
+                    )
+                } else {
+                    probeHeartbeat(log, now)
+                }
+
+                // H2 discriminator: name the host call the JavaBridge thread is
+                // parked inside. Only the native side can see this, because the
+                // JS thread that would have written the matching `DONE` is
+                // blocked. Re-logged while it persists, so the last line before
+                // the file stops growing names the call.
+                gameBridge?.inFlightDescription()?.let { desc ->
+                    val split = desc.lastIndexOf(' ')
+                    if (split > 0) {
+                        val name = desc.substring(0, split)
+                        val startedAt = desc.substring(split + 1).toLongOrNull() ?: 0L
+                        val held = SystemClock.elapsedRealtime() - startedAt
+                        if (held >= INFLIGHT_WARN_MS) {
+                            log.log("INFLIGHT $name for ${held}ms")
+                        }
+                    }
+                }
+            }
+
+            if (watchdogTicks % MEMORY_TICKS == 0) sampleMemory(log)
+
+            watchdogHandler?.postDelayed(this, WATCHDOG_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * Ask the page for its heartbeat counter and JS heap. One `evaluateJavascript`
+     * gives both. A callback that never arrives is the H2 signal; the renderer
+     * being gone is reported separately by [GameWebViewClient.onRenderProcessGone].
+     */
+    private fun probeHeartbeat(log: Diag, now: Long) {
+        val view = webView ?: return
+        heartbeatPending = true
+        heartbeatSentAt = SystemClock.elapsedRealtime()
+        try {
+            view.evaluateJavascript(HEARTBEAT_JS) { raw ->
+                heartbeatPending = false
+                val payload = unwrapJsonString(raw)
+                val hb = payload?.opt("hb")?.let { if (it === JSONObject.NULL) "?" else it.toString() } ?: "?"
+                val mem = payload?.optString("mem").orEmpty().ifEmpty { "null" }
+                log.log("NATIVE_HB t=$now hb=$hb cb=ok mem=$mem")
+            }
+        } catch (e: Exception) {
+            heartbeatPending = false
+            log.log("NATIVE_HB t=$now cb=error detail=${e.javaClass.simpleName}")
+        }
+    }
+
+    /**
+     * `evaluateJavascript` wraps a returned string in JSON, so the value comes
+     * back as `"{\"hb\":12,…}"`. Unwrap once, then parse the inner object.
+     */
+    private fun unwrapJsonString(raw: String?): JSONObject? {
+        if (raw == null || raw == "null") return null
+        return try {
+            val inner = JSONObject("{\"v\":$raw}").optString("v")
+            JSONObject(inner)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Runtime + native heap, sampled on the main thread; never touches the page. */
+    private fun sampleMemory(log: Diag) {
+        val runtime = Runtime.getRuntime()
+        val nativeHeap = try {
+            Debug.getNativeHeapAllocatedSize()
+        } catch (_: Exception) {
+            -1L
+        }
+        val activityManager = getSystemService(ACTIVITY_SERVICE) as? ActivityManager
+        val memoryInfo = ActivityManager.MemoryInfo()
+        activityManager?.getMemoryInfo(memoryInfo)
+        log.log(
+            "MEM java_total=${runtime.totalMemory()} java_free=${runtime.freeMemory()} " +
+                "java_max=${runtime.maxMemory()} native=$nativeHeap " +
+                "sysAvail=${if (activityManager == null) -1L else memoryInfo.availMem} " +
+                "lowMemory=${if (activityManager == null) false else memoryInfo.lowMemory}"
+        )
+    }
+
+    /** Whether `onRenderProcessGone` has fired; set by the client below. */
+    private fun rendererAlive(): Boolean = !renderProcessGone
+
+    /**
+     * The H1 verdict and the only recovery path: the renderer is gone, so the
+     * `WebView` is unusable and must be rebuilt. Returning `true` stops the
+     * platform from killing the app, which is what keeps the log readable and
+     * lets the phone be recovered without reinstalling.
+     */
+    private fun onRendererGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+        renderProcessGone = true
+        val crashed = try {
+            detail?.didCrash() ?: true
+        } catch (_: Exception) {
+            true
+        }
+        diag?.log(
+            "RENDERER_GONE crashed=$crashed didCrashKnown=${detail != null} " +
+                "priorityAtExit=${try { detail?.rendererPriorityAtExit() ?: -1 } catch (_: Exception) { -1 }}"
+        )
+        stopWatchdog()
+        // The dead WebView must not be reused; tear it down and offer a reload.
+        try {
+            webView?.let { dead ->
+                (dead.parent as? ViewGroup)?.removeView(dead)
+                dead.destroy()
+            }
+        } catch (_: Exception) {
+            // Already gone.
+        }
+        webView = null
+        gameStarted = false
+        bridgeFailureReported = false
+        showRendererGoneDialog()
+        return true
+    }
+
+    private fun showRendererGoneDialog() {
+        if (isFinishing || isDestroyed) return
+        try {
+            AlertDialog.Builder(this)
+                .setTitle(R.string.renderer_gone_title)
+                .setMessage(R.string.renderer_gone_message)
+                .setPositiveButton(R.string.renderer_gone_reload) { _, _ ->
+                    diag?.log("RENDERER_RELOAD requested")
+                    startGame()
+                }
+                .setCancelable(false)
+                .show()
+        } catch (_: Exception) {
+            // A dialog that cannot be shown must not wedge the app.
+        }
+    }
+
+    private inner class GameWebChromeClient : WebChromeClient() {
+        override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+            diag?.log(
+                "CONSOLE ${message.messageLevel()} ${message.message()} " +
+                    "@ ${message.sourceId()}:${message.lineNumber()}"
+            )
+            return false
+        }
     }
 
     private inner class GameWebViewClient : WebViewClient() {
@@ -253,7 +480,41 @@ class MainActivity : Activity() {
 
         override fun onPageFinished(view: WebView, url: String?) {
             super.onPageFinished(view, url)
+            diag?.log("PAGE_FINISHED url=${url ?: ""}")
             view.postDelayed({ verifyBridge() }, BRIDGE_PROBE_DELAY_MS)
+            view.postDelayed({ probeWebGl() }, WEBGL_PROBE_DELAY_MS)
+        }
+
+        override fun onReceivedError(
+            view: WebView,
+            request: WebResourceRequest,
+            error: WebResourceError,
+        ) {
+            super.onReceivedError(view, request, error)
+            diag?.log(
+                "PAGE_ERROR code=${error.errorCode} mainFrame=${request.isForMainFrame} " +
+                    "desc=${error.description} url=${request.url}"
+            )
+        }
+
+        /**
+         * H1, the one outcome that actually requires action: the renderer is
+         * dead, so nothing on the page can ever advance again.
+         */
+        override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean =
+            onRendererGone(view, detail)
+    }
+
+    /**
+     * Probe the page's graphics capability once, so "the black screen is a
+     * WebGL/rendering problem" can be excluded from the log rather than guessed
+     * at: which context a plain canvas can actually get, and which driver the
+     * debug extension reports.
+     */
+    private fun probeWebGl() {
+        val view = webView ?: return
+        view.evaluateJavascript(WEBGL_PROBE_JS) { raw ->
+            diag?.log("WEBGL ${unwrapJsonString(raw) ?: "unavailable raw=${raw ?: "null"}"}")
         }
     }
 
@@ -419,6 +680,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        diag?.log("LIFECYCLE resume gameStarted=$gameStarted")
         // Backgrounding can leave a `screenOff()` brightness override in place
         // (a window attribute survives pause), so always drop it on the way back.
         gameBridge?.restoreScreenBrightness()
@@ -426,6 +688,7 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        diag?.log("LIFECYCLE pause gameStarted=$gameStarted")
         // Same reason as onResume: never leave the window black behind us.
         gameBridge?.restoreScreenBrightness()
         if (gameStarted) dispatchDocumentEvent("pause")
@@ -453,8 +716,11 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        stopWatchdog()
         webView?.destroy()
         webView = null
+        diag?.log("LIFECYCLE destroy")
+        diag?.close()
         super.onDestroy()
     }
 
@@ -599,11 +865,86 @@ class MainActivity : Activity() {
         const val LEGACY_STORAGE_REQUEST = 1001
         const val BRIDGE_PROBE_DELAY_MS = 500L
 
-        /** What `shouldInterceptRequest` prepends to `script.js` (Ruling C). */
-        const val WINDOW_NATIVE_ALIAS = "window.__GCNative = window.AndroidBridge;"
+        /* ---- Task 11 watchdog cadence (all main-looper) ---- */
+
+        /** Base tick of the watchdog runnable. */
+        const val WATCHDOG_INTERVAL_MS = 1000L
+
+        /** Poll the page heartbeat every 2 ticks (2 s). */
+        const val HEARTBEAT_TICKS = 2
+
+        /** Sample memory every 5 ticks (5 s). */
+        const val MEMORY_TICKS = 5
+
+        /** A host call held longer than this is named in an `INFLIGHT` line. */
+        const val INFLIGHT_WARN_MS = 2000L
+
+        /** How long after `onPageFinished` the one-off WebGL probe runs. */
+        const val WEBGL_PROBE_DELAY_MS = 1500L
+
+        /**
+         * What `shouldInterceptRequest` prepends to `script.js` (Ruling C), plus
+         * the Task 11 diagnostic opt-in. The flag must be set *before*
+         * `gc-bridge.js` executes, which is exactly what this prefix guarantees;
+         * with it absent the shim's diagnostic paths are inert.
+         */
+        const val WINDOW_NATIVE_ALIAS =
+            "window.__GCNative = window.AndroidBridge;\n" +
+                "window.__gcDiag = true;"
 
         /** The shim, served out of the APK's assets - never off the game folder. */
         const val SHIM_ASSET = "gc-bridge.js"
+
+        /**
+         * One page round trip that yields both the heartbeat counter the shim
+         * increments every 250 ms and `performance.memory` when the WebView
+         * exposes it. The shim's counter is deliberately independent of the
+         * engine, so it keeps advancing if only the engine's own loop died.
+         */
+        const val HEARTBEAT_JS = """
+            (function () {
+              var hb = null;
+              var mem = null;
+              try { hb = window.__gcHeartbeat; } catch (e) {}
+              try {
+                if (window.performance && window.performance.memory) {
+                  var m = window.performance.memory;
+                  mem = m.usedJSHeapSize + '/' + m.totalJSHeapSize + '/' + m.jsHeapSizeLimit;
+                }
+              } catch (e) {}
+              return JSON.stringify({ hb: hb, mem: mem });
+            })();
+        """
+
+        /**
+         * Which graphics contexts a plain canvas can actually obtain, and the
+         * driver behind them, so a rendering-capability cause for the black
+         * screen can be excluded from the log rather than guessed at.
+         */
+        const val WEBGL_PROBE_JS = """
+            (function () {
+              var out = { webgl: false, webgl2: false, vendor: null, renderer: null, error: null };
+              try {
+                var canvas = document.createElement('canvas');
+                var gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                out.webgl = !!gl;
+                if (gl) {
+                  var ext = gl.getExtension('WEBGL_debug_renderer_info');
+                  if (ext) {
+                    out.vendor = String(gl.getParameter(ext.UNMASKED_VENDOR_WEBGL));
+                    out.renderer = String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL));
+                  } else {
+                    out.vendor = String(gl.getParameter(gl.VENDOR));
+                    out.renderer = String(gl.getParameter(gl.RENDERER));
+                  }
+                }
+                out.webgl2 = !!canvas.getContext('webgl2');
+              } catch (e) {
+                out.error = String(e && e.message ? e.message : e);
+              }
+              return JSON.stringify(out);
+            })();
+        """
 
         /**
          * The synthetic Escape dispatched when the player presses back, before the
