@@ -111,3 +111,96 @@ WebAudio 存活、字节口径、挂起表修复）有本机 RED→GREEN 证据�
 - [x] CI：分支 run `39215971255` success；tag run `39216236585` success（见 `task-13-report.md`）
 - [x] Release：https://github.com/wangzheruoyun/LoveNest/releases/tag/v1.0.0-diag3 ，APK 1,868,332 B，
       SHA-256 `838d0907c5f747547ca825f0b2ebea03d57910c90b9c120461a03ca1c13a1b39`
+
+---
+
+# 黑屏根因与修复（`v1.0.0-fix1`）
+
+**状态：** 根因已定案并在本机以真机 UA 复现、修复后同条件复跑通过；真机复验待用户安装
+`v1.0.0-fix1` 确认。Kotlin 侧未改动，本次只改 `assets/gc-bridge.js` 与一条单测。
+
+## 一句话根因
+
+引擎的 `FileUtils.createDirectoryForce` / `FileUtils.saveFile` 用 `Browser.onPC` 分叉且
+**没有 `else`**；手机 UA 下 `onPC = !onMobile` 为 `false`，两条分支被跳过时**它们的完成回调
+被静默丢弃**，而 `SyncTask.taskOver(FileUtils.TASK_MODIFY_FILE)` 正长在这些回调里 ⇒ 文件任务
+锁永不释放，加载完成后的一切（默认存档写入、Meta 演出、第一幕 BGM）全部卡在队列里。
+
+## 引擎源码（`script.js`，行号为解码后行号）
+
+```js
+FileUtils.createDirectoryForce = function (localURL, onFin, taskLock, ...) {
+    var taskF = function () {
+        var onCreateDirectoryFin = Callback.New(function (success, localURL) {
+            onFin && onFin.runWith([success, localURL]);
+            if (taskLock)
+                SyncTask.taskOver(FileUtils.TASK_MODIFY_FILE);   // 51173 ← 解锁唯一出口
+        }, this);
+        ...
+        if (Browser.onPC) {                                       // 51197 ← 分叉，无 else
+            ...
+            createDirectoryForce(fullURL, function () {
+                onCreateDirectoryFin.runWith([true, localURL]);   // 51204 ← 被丢弃
+            }, function () { ... }, this);
+        }
+    };
+    if (taskLock) new SyncTask(FileUtils.TASK_MODIFY_FILE, taskF);  // 51240
+};
+```
+
+`FileUtils.saveFile` 同样形状：`else if (Browser.onPC) { mainDomain_fs.writeFile(...) }`（51143）。
+
+Laya 侧：`Browser.onMobile = Browser.u.indexOf("Mobile") > -1;`（6946）、
+`Browser.onPC = !Browser.onMobile;`（6956）⇒ 任何手机 UA 都得到 `onPC = false`。
+Demo 只发行过 Windows 版（`onPC = true`），所以移动端这条分支是从未被完成的死代码。
+
+## 为什么症状是「进度条走完 → 纯黑、无异常、心跳照跑」
+
+- 加载期的素材请求由引擎自带的 loader 独立驱动，与文件任务锁无关 ⇒ 进度条正常走完。
+- 加载结束后引擎进入「建目录 → 写存档 → Meta 演出 → 载 BGM → 建第一幕」的串行队列，
+  第一步就卡在未释放的锁上 ⇒ 转场幕布被画上后再没人来揭。
+- 没有异常、没有宿主调用、页面心跳与渲染循环继续 ⇒ 与真机日志完全一致
+  （diag3 会话：141 个请求后彻底安静、`pageerrors: 0`、暗屏冻结在 `draws` 持续增长）。
+
+## 本机复现与修复证据
+
+无头驱动新增 `--ua-mobile`：在 Laya 读 UA 之前把 `navigator.userAgent` 换成真机那支
+Android WebView UA，于是 Laya **自己**算出 `onMobile=true / onPC=false` —— 不强制任何属性，
+不会与桩层互相打架。
+
+| 运行 | 引擎请求数 | 末尾请求 | `Pray_1.ogg` | Meta 演出 ×3 | 第一幕 BGM |
+|---|---|---|---|---|---|
+| 已知良好基线（桌面 UA） | 179 | 第一幕 BGM | ✅ | ✅ | ✅ |
+| 真机 diag3 日志 | 141 | `btn_normal.png` | ❌ | ❌ | ❌ |
+| `--ua-mobile`，修复前 | **与真机一致** | `btn_normal.png` | ❌ | ❌ | ❌ |
+| `--ua-mobile`，修复后 | 179 | 第一幕 BGM | ✅ | ✅ | ✅ |
+
+- 修复后 `--ua-mobile` 的请求流与已知良好基线**逐条相同（179/179，0 处差异）**。
+- 桌面 UA 下修复前后同为 179 条、地标全中，且不打印 `Desktop parity` ⇒ **修复在桌面环境是惰性的**。
+- 单测 `bridge.test.js`「onPC」三例：修复前 RED（3 例全失败）→ 修复后 GREEN；全集 115/115。
+
+## 修复内容
+
+`gc-bridge.js` 在发布 `require`/`process` 之后调用 `enforceDesktopPlatform()`：每 250 ms 检查
+一次 `Laya.Browser`，把 `onPC` 置为 `true`。用定时器而不是一次性赋值，是因为
+`Browser.__init__` 是**惰性且只跑一次**的（首次访问 `Browser.*` 时执行），可能晚于本脚本。
+只动 `onPC` 一个字段：整个引擎里它只被读 3 处（上述两条分支 + Laya `TextInput` 的
+`input.focus()`）；`Browser.onMobile` 保持设备真实值，Laya 的触摸绑定不受影响。
+
+## 真机复验清单（安装 `v1.0.0-fix1`）
+
+- [ ] 覆盖安装（同正式密钥签名），保留「所有文件访问」授权。
+- [ ] 从标题穿过「少女祈祷中」进入第一幕：有画面、有声音、可操作。
+- [ ] 黑屏期间按一次**音量减**可立即 dump（该构建仍带观测）；如已正常则无需。
+- [ ] 取 `/storage/emulated/0/Documents/爱之巢-logs/` 最新会话日志留档。
+- [ ] 复核游戏目录 `/storage/emulated/0/Download/爱之巢DemoV1.52/` 仍是 2047 个文件、
+      无 `savedata/`、无 `log/`（**存档写入落到游戏目录**的问题另行处理，见台账）。
+
+## 本机复现命令
+
+```bash
+cd tools/headless
+node transition-probe.js --seconds 25 --ua-mobile   # 修复前：地标全 false
+node transition-probe.js --seconds 25               # 桌面：地标全 true
+node --test --test-name-pattern='onPC'              # 单测
+```

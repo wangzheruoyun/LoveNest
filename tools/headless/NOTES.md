@@ -337,3 +337,27 @@ harness degrades to:
 - Node tests here are **local-only and never run in CI** (plan Ruling 5): they need
   the 740 MB game folder, which is not uploaded anywhere.
 - `tools/headless/out/` is scratch output and is git-ignored.
+
+## `transition-probe.js` and the black-screen root cause
+
+`transition-probe.js` boots the real game in Chromium, drives it past the title
+(curtain), then asks the engine about its own state: Laya stage tree, loader
+pending list, worker count, framebuffer samples, and the full XHR timeline.
+
+`--ua-mobile` is the **regression harness for the phone's black screen**. It
+reports the device's Android WebView user agent *before* Laya reads it, so Laya
+computes `onMobile = true` / `onPC = false` by itself — no property is forced, so
+nothing fights the shim. In that mode the run stops exactly where the device
+stops (same last request, no post-load host call, every post-load landmark
+false). With the fix in `gc-bridge.js` it matches the healthy desktop baseline
+request for request.
+
+`--host-stack` (or `LOVENEST_HOSTSTACK=1`) wraps every `__GCNative` method to
+record `new Error().stack` per host call. That is how the root cause was found:
+the frames carry real engine function names (`FileUtils.taskF`, `SyncTask.func`,
+`createDirectoryForce`) and `<anonymous>:line:col` positions that line up with
+the percent-decoded `script.js`. It writes `out/host-stacks.txt`.
+
+The other flags (`--btn-mode`, `--worker-mode`, `--patch-objectutils`,
+`--no-webgl`) are the earlier falsified hypotheses kept for reference — none of
+them reproduce the device stall.
