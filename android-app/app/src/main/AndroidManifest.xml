@@ -27,11 +27,16 @@
         android:maxSdkVersion="29" />
 
     <!--
-      The launcher icon is the demo's own 爱之巢 artwork, copied in as the plan's
-      Task 10 Step 1 explicitly allows (the single, deliberate exception to "the
-      repo holds no game resources"). It is a 512x512 RGBA PNG in one density
-      folder; Android scales it. No android:roundIcon: we only have the square
-      source, and no image tooling exists on this machine to derive a round one.
+      The launcher icon is the demo's own 爱之巢 character artwork, copied in as
+      the plan's Task 10 Step 1 explicitly allows (the single, deliberate
+      exception to "the repo holds no game resources"). Source:
+      asset/image/icon/图标.png (512x512 RGBA). The shipped file is malformed -
+      its PNG signature bytes are transposed and it contains one spurious byte -
+      so the committed copy carries those two byte-level repairs (a copy only;
+      the game folder itself is untouched). No resize or re-encode was done and
+      no image tooling was involved: the repaired file is the original pixel
+      data, proven by every chunk CRC validating and the IDAT stream inflating
+      to exactly 512x512x4 plus filter bytes. See task-10-report.md.
     -->
     <application
         android:allowBackup="false"
