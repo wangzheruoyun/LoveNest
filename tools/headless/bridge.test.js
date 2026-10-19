@@ -1004,3 +1004,33 @@ test('壁纸成功读取后缓存，多次探测只读一次；失败不缓存�
   assert.throws(() => fsShim.readFileSync(file, { encoding: null }),
     (err) => err && err.code === 'ENOENT');
 });
+
+test('引擎改壁纸后缓存失效，下一次读取重新取图（不得沿用改前那张）', () => {
+  const before = Buffer.from('WALLPAPER-BEFORE').toString('base64');
+  const after = Buffer.from('WALLPAPER-AFTER').toString('base64');
+  let current = before;
+  let asked = 0;
+  let set = 0;
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.getWallpaper = () => { asked++; return current; };
+  host.setWallpaper = () => { set++; };
+  const w = loadBridge(host);
+  const fsShim = w.require('fs');
+  const cp = w.require('child_process');
+  const path = w.require('path');
+  const cached = path.join(w.process.env.APPDATA, '\\Microsoft\\Windows\\Themes\\CachedFiles\\');
+  const file = path.join(cached, 'TranscodedWallpaper');
+
+  assert.strictEqual(fsShim.readFileSync(file, { encoding: null }).toString('base64'), before);
+  assert.strictEqual(asked, 1, '首次读取取图一次');
+
+  // The engine's "change the desktop wallpaper": `reg add … /v Wallpaper /d "<file>"`.
+  cp.execSync('reg add "HKCU\\Control Panel\\Desktop" /v Wallpaper /d "' +
+    GAME_ROOT + '/icon.png" /f');
+  assert.strictEqual(set, 1, '改壁纸必须真的调 setWallpaper()');
+
+  current = after;
+  assert.strictEqual(fsShim.readFileSync(file, { encoding: null }).toString('base64'), after,
+    '改壁纸后必须重新取图，不得沿用改前那张');
+  assert.strictEqual(asked, 2, '缓存必须已失效');
+});

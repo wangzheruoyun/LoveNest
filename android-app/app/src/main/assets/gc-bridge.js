@@ -412,10 +412,20 @@
       wallpaperCacheFn = getter;
       wallpaperCacheValue = value;
     } else {
-      wallpaperCacheFn = null;
-      wallpaperCacheValue = null;
+      invalidateWallpaperCache();
     }
     return value;
+  }
+
+  /**
+   * Drop the memoised wallpaper. Called when a read fails (so the next probe
+   * retries) and whenever the engine *changes* the wallpaper — otherwise a
+   * performance that sets the wallpaper and then reads it back would show the
+   * image from before the change.
+   */
+  function invalidateWallpaperCache() {
+    wallpaperCacheFn = null;
+    wallpaperCacheValue = null;
   }
 
   /** True when `abs` (already host-absolute) is inside the virtual tree. */
@@ -1491,6 +1501,8 @@
     // "change the desktop wallpaper".
     if (lower.indexOf('reg add') !== -1 && lower.indexOf('wallpaper') !== -1) {
       setWallpaperFromCommand(text);
+      // The desktop wallpaper just changed; the cached read is now stale.
+      invalidateWallpaperCache();
       return '';
     }
 
