@@ -8,7 +8,6 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.graphics.Color
-import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -20,6 +19,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.widget.Toast
+import androidx.core.content.FileProvider
 import java.io.File
 import org.json.JSONArray
 
@@ -60,6 +60,14 @@ class GameBridge(
 
     private val game = DirectFileSource(File(gameRoot))
     private val docs = DirectFileSource(File(docsRoot))
+
+    /**
+     * Where a path becomes a file: game root first, then the documents root. The
+     * composition lives in [RootedPathAuthority] so it is unit-tested without an
+     * `Activity` - it is what decides where saves land.
+     */
+    private val paths = RootedPathAuthority(game, docs)
+
     private val main = Handler(Looper.getMainLooper())
 
     init {
@@ -270,24 +278,33 @@ class GameBridge(
     /**
      * Stand-in for `nw.Shell.openItem()`.
      *
-     * On API 24+ a `file://` URI may not be handed to another app, so without a
-     * `FileProvider` (which would need androidx, and this module deliberately has
-     * no dependencies) this usually reports `false` rather than crashing. The
-     * contract allows a refusal, and the engine treats it as "could not open".
+     * Hands another app a `content://` URI through androidx `FileProvider`, because on
+     * API 24+ a `file://` URI sent to another app throws `FileUriExposedException` - so
+     * the old `Uri.fromFile` version was dead on every API this app supports
+     * (`minSdk 26`). The provider's paths are declared in `res/xml/file_paths.xml`.
+     *
+     * Still never throws: a path the provider refuses and a device with no viewer both
+     * come back as `false`, which the contract allows and the engine reads as "could
+     * not open".
      */
     @JavascriptInterface
     fun openFile(path: String?): Boolean {
         val file = resolve(path) ?: return false
         return try {
             if (!file.exists()) return false
+            val uri = FileProvider.getUriForFile(activity, fileProviderAuthority(), file)
             activity.startActivity(
-                Intent(Intent.ACTION_VIEW).setDataAndType(Uri.fromFile(file), "*/*")
+                Intent(Intent.ACTION_VIEW)
+                    .setDataAndType(uri, "*/*")
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             )
             true
         } catch (_: Exception) {
             false
         }
     }
+
+    private fun fileProviderAuthority(): String = activity.packageName + FILE_PROVIDER_SUFFIX
 
     /** Vibration for the Meta performances (`navigator.vibrate` on platform 4). */
     @JavascriptInterface
@@ -337,14 +354,10 @@ class GameBridge(
     /**
      * The one place a `__GCNative` path becomes a file: game root first (POSIX
      * `resolve` relative to the working directory, matching the harness), then
-     * the documents root. `null` means "refuse".
+     * the documents root. `null` means "refuse". Delegates to
+     * [RootedPathAuthority], which is unit-tested.
      */
-    private fun resolve(path: String?): File? {
-        if (path.isNullOrEmpty()) return null
-        game.resolve(path)?.let { return File(it) }
-        docs.resolve(path)?.let { return File(it) }
-        return null
-    }
+    private fun resolve(path: String?): File? = paths.resolveFile(path)
 
     /** Non-ASCII becomes `?`, exactly as the shim's own `asciiOnly` does. */
     private fun asciiOnly(value: String?): String {
@@ -359,5 +372,8 @@ class GameBridge(
         const val CLIP_LABEL = "Love Nest"
         const val SHUTDOWN_BLACKOUT_MS = 1200L
         const val MAX_VIBRATION_MS = 10_000L
+
+        /** Matches `android:authorities="${applicationId}.fileprovider"` in the manifest. */
+        const val FILE_PROVIDER_SUFFIX = ".fileprovider"
     }
 }

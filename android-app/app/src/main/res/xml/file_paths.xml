@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The only paths GameBridge.openFile() may expose through FileProvider: the user's
+  own game folder (read in place) and the documents root that receives saves. Both
+  are under Environment.getExternalStorageDirectory() (/storage/emulated/0), so
+  <external-path> is the right element. Nothing outside these two trees is
+  reachable.
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <external-path name="game_root" path="Download/爱之巢DemoV1.52" />
+    <external-path name="docs_root" path="Documents/爱之巢DemoV1.52" />
+</paths>

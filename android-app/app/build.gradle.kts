@@ -32,8 +32,10 @@ android {
 }
 
 dependencies {
-    // The only dependency in this module. Path mapping / base64 unit tests are
-    // pure JVM code, so plain JUnit 4 keeps the app itself dependency-free.
+    // androidx.core provides FileProvider, which is the only correct way to hand a
+    // user file to another app on API 24+ (GameBridge.openFile, i.e. nw.Shell.openItem).
+    // JUnit stays the only test dependency: path/base64 tests are pure JVM code.
+    implementation("androidx.core:core:1.13.1")
     testImplementation("junit:junit:4.13.2")
 }
 

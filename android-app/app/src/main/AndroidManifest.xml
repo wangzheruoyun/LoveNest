@@ -42,5 +42,21 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          Backs GameBridge.openFile() (nw.Shell.openItem -> a system Intent). On API
+          24+ a file:// URI cannot be handed to another app, so the URI has to be a
+          content:// one; file_paths.xml confines the provider to the game root and
+          the documents root, nothing else. No INTERNET permission is involved.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

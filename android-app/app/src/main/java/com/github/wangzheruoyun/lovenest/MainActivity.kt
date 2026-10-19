@@ -40,11 +40,12 @@ import java.util.Collections
  * - [INTERCEPT_SCRIPT] (default) intercepts the `script.js` response and prefixes
  *   the shim to it. `location.href` stays on the real `index.html`, which is the
  *   most faithful arrangement.
- * - [LAUNCHER_HTML] loads a small launcher page from the app's private directory
- *   that pulls the same files in the same order. This is the design's documented
- *   fallback for the risk that `shouldInterceptRequest` is not invoked for
- *   `file://` subresources on some Android version. It is insurance, not a
- *   second architecture.
+ * - [LAUNCHER_HTML] loads a small synthetic page that pulls the same files in the
+ *   same order, but gives the document the game's own `index.html` URL as its base
+ *   and history URL, so the engine's `location.pathname`-derived asset root points
+ *   at the game folder. This is the design's documented fallback for the risk that
+ *   `shouldInterceptRequest` is not invoked for `file://` subresources on some
+ *   Android version. It is insurance, not a second architecture.
  *
  * Switch by changing [MainActivity.INJECTION_MODE].
  */
@@ -226,8 +227,18 @@ class MainActivity : Activity() {
         when (INJECTION_MODE) {
             // Keep the URL the engine sees: file:///…/index.html, so its platform
             // probe (`location.href.indexOf("file") == 0`) holds.
-            InjectionMode.INTERCEPT_SCRIPT -> view.loadUrl(Uri.fromFile(gameIndex).toString())
-            InjectionMode.LAUNCHER_HTML -> view.loadUrl(Uri.fromFile(writeLauncherHtml()).toString())
+            InjectionMode.INTERCEPT_SCRIPT -> view.loadUrl(gameIndexUrl())
+
+            // The fallback. `loadDataWithBaseURL` (not a `filesDir` page) makes the
+            // document's own URL the game's `index.html` - see [launcherHtml] for why
+            // that is the whole point.
+            InjectionMode.LAUNCHER_HTML -> view.loadDataWithBaseURL(
+                gameIndexUrl(),   // base URL: relative script/asset URLs resolve here
+                launcherHtml(),
+                "text/html",
+                "UTF-8",
+                gameIndexUrl(),   // history URL: the document's own URL
+            )
         }
     }
 
@@ -260,8 +271,19 @@ class MainActivity : Activity() {
     private fun interceptScript(request: WebResourceRequest): WebResourceResponse? {
         if (INJECTION_MODE != InjectionMode.INTERCEPT_SCRIPT) return null
         val url = request.url?.toString() ?: return null
-        val script = scriptFileFor(url) ?: return null
         return try {
+            // The URL -> file mapping (percent-decoding and containment) lives in
+            // ScriptRequest, which routes containment through DirectFileSource.resolve
+            // like every other path. It is inside the try so a malformed escape can
+            // never escape as an exception.
+            val script = ScriptRequest.fileFor(url, GAME_ROOT)
+            if (script == null) {
+                if (url.contains("/${ScriptRequest.FILE_NAME}")) {
+                    Log.w(TAG, "ignoring an unresolved script.js request: $url")
+                }
+                return null
+            }
+
             // Order matters: the alias must exist before the shim runs (it reads
             // `window.__GCNative` at its top), and the shim must exist before the
             // engine runs. The shim is streamed straight out of the APK's assets,
@@ -283,75 +305,60 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * Map a `script.js` request URL to the real file, or `null` to let the
-     * WebView handle it normally.
-     *
-     * The trap here is the URL encoding: `Uri.fromFile` percent-encodes the
-     * Chinese directory name, so the request carries
-     * `/storage/…/Download/%E7%88%B1%E4%B9%8B%E5%B7%A2…/script.js?r=…` rather than
-     * the raw characters. Matching the raw path only would never match, the shim
-     * would never run, and the game would come up looking fine on platform 3.
-     * Decoding with `Uri.decode` (which, unlike `URLDecoder`, leaves `+` alone)
-     * makes the comparison work whether or not the URL arrived encoded.
-     */
-    private fun scriptFileFor(url: String): File? {
-        val withoutQuery = url.substringBefore('?').substringBefore('#')
-        if (!withoutQuery.startsWith("file://")) return null
-        val decoded = Uri.decode(withoutQuery).removePrefix("file://")
-        if (!decoded.endsWith("/script.js")) return null
-        if (!decoded.startsWith("$GAME_ROOT/")) {
-            Log.w(TAG, "ignoring a script.js request outside the game root: $decoded")
-            return null
-        }
-        val file = File(decoded)
-        if (!file.isFile) {
-            Log.w(TAG, "script.js request did not resolve to a readable file: $decoded")
-            return null
-        }
-        return file
-    }
+    /** The URL the engine itself loads: `file:///…/index.html`, percent-encoded. */
+    private fun gameIndexUrl(): String = Uri.fromFile(gameIndex).toString()
 
     /**
-     * The documented fallback launcher (design §5.2). It lives in the app's
-     * private directory - never in the game folder - and pulls the shim from the
-     * APK's assets, then the engine exactly as `index.html` would.
+     * The documented fallback launcher (design §5.2), loaded with
+     * `loadDataWithBaseURL` rather than from a file in `filesDir`.
+     *
+     * The engine derives *where assets live* from `location.pathname`, not from a
+     * `<base href>`:
+     *
+     * ```
+     * pathName = location.pathname;                    // the document's own URL
+     * URL.rootPath = URL.basePath = URL.getPath(pathName);   // dir of pathname
+     * ... return (base || URL.basePath) + url;         // every asset URL
+     * ```
+     *
+     * So a page at `file:///data/user/0/<pkg>/files/launcher.html` would resolve every
+     * asset under `filesDir` and 404 - while still booting on platform 2, i.e. silently.
+     * Passing the game's `index.html` URL as both the base **and** the history URL makes
+     * `location.pathname` the game path, so `URL.basePath` is the game root and relative
+     * `script.js` / asset URLs resolve there. `location.href` still starts with `file`,
+     * so platform detection still yields 2. Nothing is written to disk.
      */
-    private fun writeLauncherHtml(): File {
-        val base = Uri.fromFile(File(GAME_ROOT)).toString() + "/"
-        val html = """
-            <!DOCTYPE html>
-            <html>
-            <head>
-            <meta charset="utf-8"/>
-            <base href="$base"/>
-            <script>$WINDOW_NATIVE_ALIAS</script>
-            <script src="file:///android_asset/gc-bridge.js"></script>
-            </head>
-            <body style="margin:0;background:#000">
-            <script src="script.js?r=1"></script>
-            <script>if (typeof main != 'undefined') { main(); } else { console.trace('main is undefined'); }</script>
-            </body>
-            </html>
-        """.trimIndent()
-        val file = File(filesDir, "launcher.html")
-        file.writeText(html)
-        return file
-    }
+    private fun launcherHtml(): String = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset="utf-8"/>
+        <script>$WINDOW_NATIVE_ALIAS</script>
+        <script src="file:///android_asset/gc-bridge.js"></script>
+        </head>
+        <body style="margin:0;background:#000">
+        <script src="script.js?r=1"></script>
+        <script>if (typeof main != 'undefined') { main(); } else { console.trace('main is undefined'); }</script>
+        </body>
+        </html>
+    """.trimIndent()
 
     /* ------------------------------------------------------------------ *
      * Ruling D: make a platform-3 fallback impossible to miss
      * ------------------------------------------------------------------ */
 
     /**
-     * Ask the live page whether the shim actually took.
+     * Ask the live page whether the shim actually took, and whether the page can
+     * reach a real asset.
      *
      * `window.AndroidBridge` is registered independently of the injection, so
      * this probe can report the failure even in the exact case where the shim
      * never loaded. It is deliberately non-fatal: it never throws and never
      * blocks the game, it only makes the silent platform-3 fallback (no Meta
      * performances, saves quietly routed to IndexedDB) loud - a logcat line for
-     * the developer and a toast for whoever is holding the phone.
+     * the developer and a toast for whoever is holding the phone. The jQuery-free
+     * asset probe inside [BRIDGE_PROBE_JS] reports its own outcome the same way
+     * (logcat + toast), so "platform 2 but no assets" cannot hide either.
      */
     private fun verifyBridge() {
         val view = webView ?: return
@@ -538,15 +545,50 @@ class MainActivity : Activity() {
          * token instead of reporting through `AndroidBridge` keeps `GameBridge`
          * at exactly the 21 contract methods and lets the Kotlin side log at
          * error level.
+         *
+         * It also makes the *asset* silent failure impossible: it writes
+         * `location.href` and `location.pathname` to logcat (through the
+         * existing bridge `log` member), then requests one real game file
+         * (`icon.png` at the game root) with an `Image`. If that fails it reports
+         * through the bridge again - a logcat line **and** a Toast. A page that
+         * boots on platform 2 but cannot resolve its own assets is exactly the
+         * failure the fallback used to hide; it now announces itself. Nothing
+         * here throws, and nothing blocks the game.
          */
         const val BRIDGE_PROBE_JS = """
             (function () {
               var requireOk = false;
               var platform = null;
+              var href = '';
+              var path = '';
               try { requireOk = (typeof window.require === 'function'); } catch (e) {}
               try {
                 if (window.os && typeof window.os.platform !== 'undefined') platform = window.os.platform;
               } catch (e) {}
+              try { href = String(location.href); } catch (e) {}
+              try { path = String(location.pathname); } catch (e) {}
+
+              function bridge() { try { return window.AndroidBridge; } catch (e) { return null; } }
+              function say(msg) { try { var b = bridge(); if (b && b.log) b.log(msg); } catch (e) {} }
+
+              say('probe location.href=' + href + ' location.pathname=' + path);
+
+              // Prove the page can actually reach a real game asset from wherever it
+              // thinks it lives. Relative to the document URL, which is what the
+              // engine's URL.basePath is derived from.
+              try {
+                var img = new Image();
+                img.onload = function () { say('probe asset ok: ' + img.src); };
+                img.onerror = function () {
+                  say('probe asset FAILED to load: ' + img.src);
+                  try {
+                    var b = bridge();
+                    if (b && b.toast) b.toast('游戏资源无法加载（资源路径错误）: ' + img.src);
+                  } catch (e) {}
+                };
+                img.src = 'icon.png';
+              } catch (e) {}
+
               if (requireOk && platform === 2) return 'OK';
               return 'FAIL require=' + requireOk + ' os.platform=' + platform;
             })();
