@@ -108,4 +108,6 @@ WebAudio 存活、字节口径、挂起表修复）有本机 RED→GREEN 证据�
 
 - [ ] 真机日志（待补：`FB sample` 序列 + `NATIVE_HB` 表格）
 - [x] RED（`pending-probe` 5 中 4 失败；`bridge.test.js` 5 失败，均打旧 shim）→ GREEN（`112/112`）（见 `task-13-report.md`）
-- [ ] CI run id（见 `task-13-report.md`）
+- [x] CI：分支 run `39215971255` success；tag run `39216236585` success（见 `task-13-report.md`）
+- [x] Release：https://github.com/wangzheruoyun/LoveNest/releases/tag/v1.0.0-diag3 ，APK 1,868,332 B，
+      SHA-256 `838d0907c5f747547ca825f0b2ebea03d57910c90b9c120461a03ca1c13a1b39`
