@@ -899,13 +899,31 @@
     ctxCreateErr: 0,
     ctxLostPrevented: 0,
     audPlay: 0,
+    // Task 13: WebAudio nodes are what the engine actually plays through (the
+    // device run showed `audioEl=0` while an AudioContext was `running`), so
+    // counting `<audio>` elements alone never measured "is it still making
+    // sound". These two counters count rendered audio buffers directly.
+    absStart: 0,
+    absStop: 0,
+    // Task 13: per-frame GL activity. Cheap increments (a few per frame) so
+    // they cannot perturb the rAF/frame-rate measurement they sit next to.
+    draws: 0,
+    clear: 0,
+    texUp: 0,
+    readPx: 0,
+    bufData: 0,
     audioContexts: [],
     glContexts: [],
     pending: {},
     pendingSeq: 0,
     pendingCount: 0,
     resources: [],
-    factsLogged: false
+    factsLogged: false,
+    // Task 13: the one-shot framebuffer sample request. A trigger (timer /
+    // STALL / volume-down) only *arms* this; the read itself happens inside
+    // the engine's next rAF callback frame (see diagRunCanvasSample).
+    fbSamplePending: 0,
+    fbSampleReason: ''
   };
 
   /** Mark a canvas as having yielded a WebGL context, for the facts line. */
@@ -931,13 +949,17 @@
     for (i = 0; i < diagState.glContexts.length; i++) {
       if (diagState.glContexts[i].ctx === ctx) return;
     }
-    diagState.glContexts.push({ ctx: ctx, canvas: canvas, type: String(type || '') });
+    // `lost` is the per-context state the framebuffer sample reports, as
+    // opposed to `diagState.ctxLost`, which is a whole-session count.
+    var entry = { ctx: ctx, canvas: canvas, type: String(type || ''), lost: false };
+    diagState.glContexts.push(entry);
     try { canvas.__gcDiagGl = true; } catch (e) {}
 
     if (typeof canvas.addEventListener !== 'function') return;
     try {
       canvas.addEventListener('webglcontextlost', function (event) {
         diagState.ctxLost++;
+        entry.lost = true;
         var size = diagCanvasSize(canvas);
         diagWrite('CTX lost canvas=' + size.w + 'x' + size.h + ' type=' + type);
         diagSetTimeout(function () {
@@ -949,6 +971,7 @@
       }, false);
       canvas.addEventListener('webglcontextrestored', function () {
         diagState.ctxRestored++;
+        entry.lost = false;
         var size = diagCanvasSize(canvas);
         diagWrite('CTX restored canvas=' + size.w + 'x' + size.h + ' type=' + type);
       }, false);
@@ -994,10 +1017,179 @@
       }
       var wrapped = function (timestamp) {
         diagState.rafFired++;
-        return callback.call(this, timestamp);
+        // The engine draws *inside* this callback. The framebuffer sample must
+        // therefore run here, in the same frame, right after the callback
+        // returns — see diagRunCanvasSample() for why a timer cannot be used.
+        try {
+          return callback.call(this, timestamp);
+        } finally {
+          try { diagRunCanvasSample(); } catch (e) {}
+        }
       };
       return originalRaf.call(win, wrapped);
     };
+  }
+
+  /* ---- Task 13: draw-call counters and the framebuffer sample ---------- */
+
+  /**
+   * Wrap the GL methods the black-screen question hinges on, each into one
+   * cheap counter (a handful of increments per frame, so the counters cannot
+   * perturb the frame-rate measurement they sit next to):
+   *
+   *   draws  = drawArrays + drawElements + drawArraysInstanced + drawElementsInstanced
+   *   clear  = clear + clearColor
+   *   texUp  = texImage2D + texSubImage2D
+   *   readPx = readPixels
+   *
+   * `bufferData` is counted too but only surfaces in the dump, since it has no
+   * heartbeat field. Both GL prototypes are wrapped; a method WebGL2 inherits
+   * from WebGL1 is skipped the second time, so it cannot double-count.
+   */
+  function diagInstallDrawProbe() {
+    var names = [
+      ['drawArrays', 'draws'],
+      ['drawElements', 'draws'],
+      ['drawArraysInstanced', 'draws'],
+      ['drawElementsInstanced', 'draws'],
+      ['clear', 'clear'],
+      ['clearColor', 'clear'],
+      ['texImage2D', 'texUp'],
+      ['texSubImage2D', 'texUp'],
+      ['bufferData', 'bufData'],
+      ['readPixels', 'readPx']
+    ];
+    var protos = [];
+    try { if (win.WebGLRenderingContext) protos.push(win.WebGLRenderingContext.prototype); } catch (e) {}
+    try { if (win.WebGL2RenderingContext) protos.push(win.WebGL2RenderingContext.prototype); } catch (e) {}
+    for (var p = 0; p < protos.length; p++) {
+      for (var i = 0; i < names.length; i++) {
+        try {
+          var proto = protos[p];
+          if (!proto) continue;
+          var original = proto[names[i][0]];
+          if (typeof original !== 'function' || original.__gcDiagCounter) continue;
+          (function (proto2, method, key, originalMethod) {
+            var wrapped = function () {
+              diagState[key]++;
+              return originalMethod.apply(this, arguments);
+            };
+            wrapped.__gcDiagCounter = true;
+            proto2[method] = wrapped;
+          })(proto, names[i][0], names[i][1], original);
+        } catch (e) {}
+      }
+    }
+  }
+
+  /** The largest WebGL context/canvas on the page, or null when there is none. */
+  function diagPickGlContext() {
+    var target = null;
+    var bestArea = -1;
+    for (var i = 0; i < diagState.glContexts.length; i++) {
+      var item = diagState.glContexts[i];
+      var size = diagCanvasSize(item.canvas);
+      var area = size.w * size.h;
+      if (area > bestArea) {
+        bestArea = area;
+        target = item;
+      }
+    }
+    return target;
+  }
+
+  /**
+   * Arm exactly one framebuffer sample. Triggers — the t+8/16/30 s timers, the
+   * STALL detector (through the native `SAMPLE_FB_*` call) and volume-down —
+   * only set this flag; the read itself runs from `diagRunCanvasSample()`,
+   * which is invoked from the rAF wrapper. Several triggers before that frame
+   * collapse into one sample (the newest reason wins). This is the entry point
+   * the native side calls as `window.__gcDiagSampleCanvas(reason)`.
+   */
+  function diagRequestCanvasSample(reason) {
+    diagState.fbSamplePending = 1;
+    diagState.fbSampleReason = String(reason || '');
+  }
+
+  /**
+   * Read a sparse 16x16 = 256-point grid out of the engine's framebuffer and
+   * write one `FB sample …` line.
+   *
+   * This MUST run inside the engine's rAF callback, immediately after the
+   * engine's own callback has returned — hence it is called from the rAF
+   * wrapper and never from a timer. With the default
+   * `preserveDrawingBuffer: false` the drawing buffer is only guaranteed to
+   * hold the frame until the end of the frame in which it was drawn; once the
+   * browser has composited, a `readPixels` issued from a `setTimeout` reads an
+   * undefined buffer (usually the cleared one) and would report "black" no
+   * matter what the engine actually painted. In-frame is the whole point.
+   *
+   * Fields: `pts` grid points read; `nonBlack` those whose maximum channel is
+   * above 8 (a small tolerance for GL noise); `mean` the average channel over
+   * every point, black pixels included; `max` the largest channel seen;
+   * `ctxLost` the target context's own lost state; `glErr` `getError()`
+   * immediately after the reads (the brief asks for the error when
+   * `readPixels` fails or returns all-zero). `t`/`reason` are extensions that
+   * let the controller tell a timer sample from a STALL or manual one.
+   */
+  function diagRunCanvasSample() {
+    if (!diagState.fbSamplePending) return;
+    diagState.fbSamplePending = 0;
+    var reason = diagState.fbSampleReason;
+    var target = diagPickGlContext();
+    if (!target) {
+      diagWrite('FB sample none t=' + diagNow() + ' reason=' + reason);
+      return;
+    }
+    var size = diagCanvasSize(target.canvas);
+    var buf = new Uint8Array(4);
+    var pts = 0;
+    var nonBlack = 0;
+    var maxChannel = 0;
+    var sumR = 0;
+    var sumG = 0;
+    var sumB = 0;
+    var errorName = '';
+    try {
+      var gl = target.ctx;
+      for (var gy = 0; gy < 16; gy++) {
+        var y = Math.floor((gy + 0.5) * size.h / 16);
+        for (var gx = 0; gx < 16; gx++) {
+          var x = Math.floor((gx + 0.5) * size.w / 16);
+          buf[0] = 0;
+          buf[1] = 0;
+          buf[2] = 0;
+          buf[3] = 0;
+          gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+          var r = buf[0];
+          var g = buf[1];
+          var b = buf[2];
+          pts++;
+          sumR += r;
+          sumG += g;
+          sumB += b;
+          if (r > maxChannel) maxChannel = r;
+          if (g > maxChannel) maxChannel = g;
+          if (b > maxChannel) maxChannel = b;
+          if (r > 8 || g > 8 || b > 8) nonBlack++;
+        }
+      }
+    } catch (e) {
+      errorName = (e && e.name) ? String(e.name) : 'error';
+    }
+    var glErr = -1;
+    try { glErr = Number(target.ctx.getError()); } catch (e) {}
+    var line = 'FB sample canvas=' + size.w + 'x' + size.h +
+      ' pts=' + pts + ' nonBlack=' + nonBlack +
+      ' mean=' + (pts ? Math.round(sumR / pts) : 0) + ',' +
+        (pts ? Math.round(sumG / pts) : 0) + ',' +
+        (pts ? Math.round(sumB / pts) : 0) +
+      ' max=' + maxChannel +
+      ' ctxLost=' + (target.lost ? 'true' : 'false') +
+      ' glErr=' + glErr +
+      ' t=' + diagNow() + ' reason=' + reason;
+    if (errorName) line += ' error=' + errorName;
+    diagWrite(line);
   }
 
   /** One `RAF_NEVER_USED` record if nothing schedules a frame in 10 s. */
@@ -1041,6 +1233,28 @@
     try { win[name] = Wrapped; } catch (e) {}
   }
 
+  /**
+   * Wrap one prototype method so a named counter increments on every call,
+   * then pass the call through untouched (same `this`, same arguments, same
+   * return value). Idempotent, and a no-op when the constructor/method is
+   * absent. Used for the GL call counters and the WebAudio node counters.
+   */
+  function diagHookCounterMethod(ctor, method, key) {
+    try {
+      if (typeof ctor !== 'function' || !ctor.prototype) return;
+      var proto = ctor.prototype;
+      var original = proto[method];
+      if (typeof original !== 'function') return;
+      if (original.__gcDiagCounter) return;
+      var wrapped = function () {
+        diagState[key]++;
+        return original.apply(this, arguments);
+      };
+      wrapped.__gcDiagCounter = true;
+      proto[method] = wrapped;
+    } catch (e) {}
+  }
+
   /** Count `play()` calls; an audio start is otherwise invisible page-side. */
   function diagInstallAudioProbe() {
     try {
@@ -1056,13 +1270,20 @@
         };
       }
     } catch (e) {}
+    // Task 13: the engine plays through WebAudio, so `AudioBufferSourceNode`
+    // start/stop — not `<audio>` — is the real "is it still making sound".
+    try {
+      var ABS = win && win.AudioBufferSourceNode;
+      diagHookCounterMethod(ABS, 'start', 'absStart');
+      diagHookCounterMethod(ABS, 'stop', 'absStop');
+    } catch (e) {}
     diagHookAudioContext('AudioContext');
     diagHookAudioContext('webkitAudioContext');
   }
 
   /** Audio liveness sampled at every heartbeat (and in a STALL dump). */
   function diagAudioFacts() {
-    var out = { elements: 0, paused: 0, maxTime: 0, ended: 0, contexts: [] };
+    var out = { elements: 0, paused: 0, maxTime: 0, ended: 0, contexts: [], ctxTime: -1 };
     try {
       var nodes = (win.document && win.document.querySelectorAll) ?
         win.document.querySelectorAll('audio, video') : null;
@@ -1079,6 +1300,12 @@
     } catch (e) {}
     for (var j = 0; j < diagState.audioContexts.length; j++) {
       out.contexts.push(diagAudioState(diagState.audioContexts[j]));
+      // Task 13: `currentTime` is the audio clock. If it stops advancing while
+      // the picture is black, the engine's audio graph is dead too.
+      try {
+        var ct = Number(diagState.audioContexts[j].currentTime);
+        if (!isNaN(ct) && ct > out.ctxTime) out.ctxTime = ct;
+      } catch (e) {}
     }
     return out;
   }
@@ -1096,16 +1323,57 @@
   }
 
   /**
-   * Completed-XHR byte count without assuming a response shape. `responseText`
-   * throws for `arraybuffer`/`blob`; `status` can throw on a torn-down request.
+   * UTF-8 byte length of a JS string, without `TextEncoder` (it is not part of
+   * the ES5 shim's vocabulary and may be absent in the harness). Correct for
+   * BMP text and for surrogate pairs; a lone surrogate is counted as the 3-byte
+   * U+FFFD that the WebView would emit.
    */
-  function diagXhrBytes(xhr) {
+  function diagUtf8Bytes(str) {
+    var bytes = 0;
+    for (var i = 0; i < str.length; i++) {
+      var c = str.charCodeAt(i);
+      if (c < 0x80) bytes += 1;
+      else if (c < 0x800) bytes += 2;
+      else if (c >= 0xd800 && c <= 0xdbff) {
+        var next = str.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) { bytes += 4; i++; }
+        else bytes += 3;
+      } else bytes += 3;
+    }
+    return bytes;
+  }
+
+  /**
+   * Byte accounting for a finished XHR, carrying the *source* of the number and
+   * the `responseText` length separately.
+   *
+   * `bytes` is a real byte count wherever one exists:
+   *   - `arraybuffer` / `blob` → the response's `byteLength` / `size`;
+   *   - text                   → the string's UTF-8 byte length.
+   * `len` is `responseText.length`, i.e. UTF-16 code units, and `-1` for binary.
+   *
+   * This fixes the v2 measurement defect: reading `responseText.length` on a
+   * Chinese JSON reported 971490 against 1025562 bytes on disk, because code
+   * units are not bytes. `src`/`len` now make the two distinguishable in the log.
+   */
+  function diagXhrByteInfo(xhr) {
+    var info = { bytes: -1, src: 'null', len: -1 };
     try {
       var type = String(xhr.responseType || '');
-      if (type === 'arraybuffer' || type === 'blob') return diagBytesOf(xhr.response);
-      return diagBytesOf(xhr.responseText);
+      if (type === 'arraybuffer' || type === 'blob') {
+        info.src = type;
+        info.bytes = diagBytesOf(xhr.response);
+        return info;
+      }
+      var text = null;
+      try { text = xhr.responseText; } catch (e) { text = null; }
+      if (text === null || text === undefined) return info;
+      info.src = 'text';
+      info.len = text.length;
+      info.bytes = diagUtf8Bytes(text);
+      return info;
     } catch (e) {
-      return -1;
+      return info;
     }
   }
 
@@ -1123,14 +1391,18 @@
     return id;
   }
 
-  function diagFinishPending(id, ok, status, bytes, err) {
+  function diagFinishPending(id, ok, status, bytes, err, info) {
     var req = diagState.pending[id];
     if (!req) return;
     diagState.pending[id] = null;
     try { delete diagState.pending[id]; } catch (e) {}
     if (diagState.pendingCount > 0) diagState.pendingCount--;
     var line = 'REQ done id=' + id + ' kind=' + req.kind + ' ok=' + ok +
-      ' status=' + status + ' bytes=' + bytes + ' ms=' + (diagNow() - req.startedAt);
+      ' status=' + status + ' bytes=' + bytes;
+    // Task 13: the *source* of the byte count and the code-unit length, when
+    // the completion came from an XHR response (see diagXhrByteInfo).
+    if (info) line += ' src=' + info.src + ' len=' + info.len;
+    line += ' ms=' + (diagNow() - req.startedAt);
     if (err) line += ' err=' + err;
     line += ' url=' + req.url;
     diagWrite(line);
@@ -1148,6 +1420,15 @@
 
     proto.open = function (method, url) {
       try {
+        // Task 13: settle a reused XHR's in-flight entry *before* the real
+        // `open()` runs. `open()` synchronously terminates an in-flight fetch
+        // and fires `abort`/`loadend` from inside that call; by then the id had
+        // already been zeroed here, so the `loadend` handler below bailed out
+        // on `if (!reqId) return;` and the entry leaked forever (`pend=7`).
+        // Reuse is the loader's normal pooling, so the abort is bookkeeping,
+        // not an error. The late `loadend` then sees id 0 and stays silent.
+        var previousId = this.__gcDiagId;
+        if (previousId) diagFinishPending(previousId, false, 0, -1, 'abort');
         this.__gcDiagMethod = String(method == null ? '' : method);
         this.__gcDiagUrl = String(url == null ? '' : url);
         this.__gcDiagId = 0;
@@ -1187,7 +1468,11 @@
             // `file://` XHR reports status 0 on success, so 0 alone is not an
             // error; only an explicit error/timeout/abort event is.
             var ok = !err && (status === 0 || (status >= 200 && status < 400));
-            diagFinishPending(reqId, ok, status, diagXhrBytes(self), err);
+            var info = diagXhrByteInfo(self);
+            // Task 13: on an abort there is no response; keep the line's
+            // `bytes=-1 src=null len=-1` rather than a misleading `src=text`.
+            if (err) info = null;
+            diagFinishPending(reqId, ok, status, info ? info.bytes : -1, err, info);
             try { self.__gcDiagId = 0; } catch (e) {}
           }, false);
         }
@@ -1363,6 +1648,14 @@
       ctxCreateErr: diagState.ctxCreateErr,
       ctxLostPrevented: diagState.ctxLostPrevented,
       audPlay: diagState.audPlay,
+      absStart: diagState.absStart,
+      absStop: diagState.absStop,
+      draws: diagState.draws,
+      clear: diagState.clear,
+      texUp: diagState.texUp,
+      readPx: diagState.readPx,
+      bufData: diagState.bufData,
+      ctxTime: audio.ctxTime,
       pend: diagState.pendingCount,
       audioElements: audio.elements,
       audioPaused: audio.paused,
@@ -1372,6 +1665,35 @@
       visibility: 'unknown'
     };
     try { out.visibility = String(win.document.visibilityState || 'unknown'); } catch (e) {}
+    return out;
+  }
+
+  /**
+   * Best-effort read of the engine's own progress counters. Every field is
+   * guarded and falls back to `null`, so a renamed/absent engine symbol never
+   * fails the dump. Laya is the engine; `os.enterFrameCount` was seen in its
+   * source, and `Laya.loader` may expose progress while a resource is pending.
+   */
+  function diagEngineFacts() {
+    var out = { enterFrameCount: null, platform: null, layaVersion: null, loaderProgress: null };
+    try {
+      if (win.os) {
+        if (win.os.enterFrameCount !== undefined) out.enterFrameCount = win.os.enterFrameCount;
+        if (win.os.platform !== undefined) out.platform = win.os.platform;
+      }
+    } catch (e) {}
+    try {
+      if (win.Laya) {
+        if (win.Laya.version !== undefined && win.Laya.version !== null) {
+          out.layaVersion = String(win.Laya.version);
+        }
+        var loader = win.Laya.loader;
+        if (loader) {
+          if (loader.progress !== undefined) out.loaderProgress = loader.progress;
+          else if (loader._progress !== undefined) out.loaderProgress = loader._progress;
+        }
+      }
+    } catch (e) {}
     return out;
   }
 
@@ -1398,6 +1720,7 @@
       t: diagNow(),
       counters: diagCounters(),
       page: diagPageFacts(),
+      engine: diagEngineFacts(),
       pending: diagPendingList(),
       resources: diagState.resources.slice(0)
     };
@@ -1543,6 +1866,9 @@
     try { diagInstallPerformanceProbe(); } catch (e) {}
     try { diagInstallVisibilityProbe(); } catch (e) {}
 
+    /* ---- Task 13 probes ---- */
+    try { diagInstallDrawProbe(); } catch (e) {}
+
     // Page facts once the engine has had a chance to build its canvas.
     try {
       if (typeof win.addEventListener === 'function') {
@@ -1553,12 +1879,24 @@
     var factsTimer = diagSetTimeout(function () { diagLogFacts('t+10s'); }, 10000);
     try { if (factsTimer && typeof factsTimer.unref === 'function') factsTimer.unref(); } catch (e) {}
 
-    // The two on-demand entry points the Activity's volume keys call.
+    // Task 13: arm one framebuffer sample at t+8/16/30 s. The reads happen in
+    // the engine's rAF frames (see diagRunCanvasSample) and give a time series
+    // across the title → loading → black transition, with no user action.
+    var fbDelays = [8000, 16000, 30000];
+    for (var fbi = 0; fbi < fbDelays.length; fbi++) {
+      (function (ms) {
+        var t = diagSetTimeout(function () { diagRequestCanvasSample('t+' + (ms / 1000) + 's'); }, ms);
+        try { if (t && typeof t.unref === 'function') t.unref(); } catch (e) {}
+      })(fbDelays[fbi]);
+    }
+
+    // The on-demand entry points the Activity's volume keys / STALL path call.
     win.__gcDiagDump = diagDump;
     win.__gcDiagCounters = diagCounters;
     win.__gcDiagLoseContext = diagLoseContext;
+    win.__gcDiagSampleCanvas = diagRequestCanvasSample;
 
-    diagWrite('DIAG on heartbeat=250ms flag=__gcDiag pack=v2');
+    diagWrite('DIAG on heartbeat=250ms flag=__gcDiag pack=v3');
   }
 
   /**

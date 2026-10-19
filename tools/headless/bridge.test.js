@@ -1190,6 +1190,8 @@ function makeFakeGl() {
     MAX_TEXTURE_SIZE: 0x0d33,
     MAX_RENDERBUFFER_SIZE: 0x84e8,
     MAX_TEXTURE_IMAGE_UNITS: 0x8872,
+    RGBA: 0x1908,
+    UNSIGNED_BYTE: 0x1401,
     getParameter(p) {
       if (p === 0x0d33) return 8192;
       if (p === 0x84e8) return 4096;
@@ -1201,6 +1203,11 @@ function makeFakeGl() {
         return { loseContext() {}, restoreContext() {} };
       }
       return null;
+    },
+    getError() { return 0; },
+    readPixels(x, y, w, h, format, type, buf) {
+      void x; void y; void w; void h; void format; void type;
+      buf[0] = 255; buf[1] = 0; buf[2] = 0; buf[3] = 255;
     }
   };
 }
@@ -1372,7 +1379,8 @@ test('XHR 挂起表在 send 后有条目，loadend 后条目被删除并记录�
   assert.deepStrictEqual(JSON.parse(w.__gcDiagDump()).pending, []);
   const done = lines.filter((s) => s.indexOf('REQ done ') === 0);
   assert.strictEqual(done.length, 1);
-  assert.ok(/ ok=true status=0 bytes=11 ms=\d+ url=file:\/\/\/asset\/json\/startup\.json$/.test(done[0]),
+  // Task 13: text responses carry their byte source and their code-unit length.
+  assert.ok(/ ok=true status=0 bytes=11 src=text len=11 ms=\d+ url=file:\/\/\/asset\/json\/startup\.json$/.test(done[0]),
     '完成行必须带实际字节数：' + done[0]);
 });
 
@@ -1507,4 +1515,186 @@ test('页面事实行包含 dpr/尺寸/可见性/画布/GL 上限', () => {
   assert.strictEqual(dump.page.gl.maxTexture, 8192);
   assert.strictEqual(dump.page.gl.maxRenderbuffer, 4096);
   assert.strictEqual(dump.page.gl.maxTextureUnits, 16);
+});
+
+/* ------------------------------------------------------------------ *
+ * Task 13 — black-screen diagnostics v3 (`window.__gcDiag`)
+ *
+ * Three load-bearing properties are pinned here:
+ *   1. flag off  → none of the new instruments exist (no GL wrapping, no
+ *      AudioBufferSourceNode wrapping, no sample entry point, no `FB …` line);
+ *   2. flag on   → the GL/WebAudio counters mean what the decision tree says;
+ *   3. flag on   → the framebuffer sample runs inside the engine's rAF frame
+ *      (never from a timer) and writes exactly one `FB sample …` line.
+ * ------------------------------------------------------------------ */
+
+function makeFakeWebGlClass() {
+  function WebGLRenderingContext() {}
+  const noop = function () {};
+  const methods = [
+    'clear', 'clearColor', 'drawArrays', 'drawElements', 'drawArraysInstanced',
+    'drawElementsInstanced', 'texImage2D', 'texSubImage2D', 'bufferData', 'readPixels'
+  ];
+  for (let i = 0; i < methods.length; i++) {
+    WebGLRenderingContext.prototype[methods[i]] = noop;
+  }
+  return WebGLRenderingContext;
+}
+
+function makeFakeAudioBufferSourceClass() {
+  function AudioBufferSourceNode() {}
+  AudioBufferSourceNode.prototype.start = function () {};
+  AudioBufferSourceNode.prototype.stop = function () {};
+  return AudioBufferSourceNode;
+}
+
+test('__gcDiag 关闭时不安装 v3 仪器（GL 计数 / WebAudio 节点 / 帧缓冲采样入口）', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const GL = makeFakeWebGlClass();
+  const ABS = makeFakeAudioBufferSourceClass();
+  const originalDrawArrays = GL.prototype.drawArrays;
+  const originalStart = ABS.prototype.start;
+  const w = loadBridge(host, {
+    WebGLRenderingContext: GL,
+    WebGL2RenderingContext: GL,
+    AudioBufferSourceNode: ABS
+  });
+
+  assert.strictEqual(w.WebGLRenderingContext.prototype.drawArrays, originalDrawArrays,
+    '关闭时不得包装 WebGL 绘制方法');
+  assert.strictEqual(w.AudioBufferSourceNode.prototype.start, originalStart,
+    '关闭时不得包装 AudioBufferSourceNode');
+  assert.strictEqual(typeof w.__gcDiagSampleCanvas, 'undefined',
+    '关闭时不得暴露帧缓冲采样入口');
+  assert.deepStrictEqual(lines.filter((s) => s.indexOf('FB ') === 0), [],
+    '关闭时不得出现任何帧缓冲采样行');
+});
+
+test('__gcDiag 开启时统计绘制调用、WebAudio 节点与音频时钟', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  diagLines(host);
+  const GL = makeFakeWebGlClass();
+  const ABS = makeFakeAudioBufferSourceClass();
+  function FakeAudioContext() {
+    this.state = 'running';
+    this.currentTime = 3.5;
+  }
+  const w = loadBridge(host, {
+    __gcDiag: true,
+    WebGLRenderingContext: GL,
+    AudioBufferSourceNode: ABS,
+    AudioContext: FakeAudioContext
+  });
+
+  const gl = new w.WebGLRenderingContext();
+  gl.clear(1);
+  gl.clearColor(0, 0, 0, 1);
+  gl.drawArrays(4, 0, 3);
+  gl.drawElements(4, 3, 1, 0);
+  gl.drawArraysInstanced(4, 0, 3, 2);
+  gl.drawElementsInstanced(4, 3, 1, 0, 1);
+  gl.texImage2D();
+  gl.texSubImage2D();
+  gl.bufferData();
+  gl.readPixels();
+
+  const abs = new w.AudioBufferSourceNode();
+  abs.start(0);
+  abs.stop(0);
+  abs.start(1);
+  new w.AudioContext();
+
+  const c = w.__gcDiagCounters();
+  assert.strictEqual(c.clear, 2, 'clear = clear + clearColor');
+  assert.strictEqual(c.draws, 4, 'draws = 四种 draw 调用之和（含 instanced）');
+  assert.strictEqual(c.texUp, 2, 'texUp = texImage2D + texSubImage2D');
+  assert.strictEqual(c.bufData, 1, 'bufferData 也计数（只在 dump 里露出）');
+  assert.strictEqual(c.readPx, 1);
+  assert.strictEqual(c.absStart, 2, 'AudioBufferSourceNode.start 次数');
+  assert.strictEqual(c.absStop, 1);
+  assert.strictEqual(c.ctxTime, 3.5, '音频时钟 currentTime 必须被读出');
+});
+
+test('__gcDiag 开启时 dump 额外携带引擎自身进度（缺失时为 null，不失败）', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  diagLines(host);
+  const w = loadBridge(host, {
+    __gcDiag: true,
+    os: { enterFrameCount: 1234, platform: 2 },
+    Laya: { version: '2.13.0', loader: { progress: 0.25 } }
+  });
+  const dump = JSON.parse(w.__gcDiagDump());
+  assert.deepStrictEqual(dump.engine, {
+    enterFrameCount: 1234,
+    platform: 2,
+    layaVersion: '2.13.0',
+    loaderProgress: 0.25
+  });
+
+  // And every field degrades to null, without throwing, when absent.
+  const w2 = loadBridge(host, { __gcDiag: true });
+  assert.deepStrictEqual(JSON.parse(w2.__gcDiagDump()).engine, {
+    enterFrameCount: null,
+    platform: null,
+    layaVersion: null,
+    loaderProgress: null
+  });
+});
+
+test('帧缓冲采样只在引擎 rAF 回调返回后同帧执行，并落一条 FB sample 行', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const callbacks = [];
+  const raf = (cb) => { callbacks.push(cb); return callbacks.length; };
+  const Canvas = makeFakeCanvasClass();
+  const document = {
+    visibilityState: 'visible',
+    addEventListener() {},
+    querySelectorAll() { return []; },
+    getElementsByTagName() { return []; }
+  };
+  const w = loadBridge(host, {
+    __gcDiag: true,
+    requestAnimationFrame: raf,
+    HTMLCanvasElement: Canvas,
+    document
+  });
+
+  const canvas = new w.HTMLCanvasElement();
+  canvas.getContext('webgl');
+
+  let engineRan = false;
+  w.requestAnimationFrame(() => { engineRan = true; });
+  w.__gcDiagSampleCanvas('test');
+
+  assert.strictEqual(lines.filter((s) => s.indexOf('FB sample') === 0).length, 0,
+    '采样不得在定时器里立刻执行，必须等引擎的这一帧');
+
+  callbacks[0]();
+  assert.strictEqual(engineRan, true);
+  const fb = lines.filter((s) => s.indexOf('FB sample ') === 0);
+  assert.strictEqual(fb.length, 1, '引擎回调返回后必须恰好落一条 FB sample：' + fb.join(' | '));
+  assert.ok(
+    /^FB sample canvas=320x180 pts=256 nonBlack=256 mean=255,0,0 max=255 ctxLost=false glErr=0 t=\d+ reason=test$/.test(fb[0]),
+    'FB sample 行格式必须精确：' + fb[0]
+  );
+
+  // A second frame with nothing armed writes nothing (one sample per arm).
+  callbacks.length = 0;
+  assert.strictEqual(fb.length, 1);
+});
+
+test('没有 WebGL 上下文时写 FB sample none', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const callbacks = [];
+  const raf = (cb) => { callbacks.push(cb); return callbacks.length; };
+  const w = loadBridge(host, { __gcDiag: true, requestAnimationFrame: raf });
+
+  w.requestAnimationFrame(() => {});
+  w.__gcDiagSampleCanvas('no-context');
+  callbacks[0]();
+  assert.ok(lines.some((s) => /^FB sample none t=\d+ reason=no-context$/.test(s)),
+    '没有 WebGL 上下文必须写 FB sample none：' + lines.join(' | '));
 });
