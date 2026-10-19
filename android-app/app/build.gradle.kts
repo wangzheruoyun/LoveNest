@@ -36,3 +36,12 @@ dependencies {
     // pure JVM code, so plain JUnit 4 keeps the app itself dependency-free.
     testImplementation("junit:junit:4.13.2")
 }
+
+// Print every unit test's outcome. CI is the only place these can run (there is
+// no JDK/Android SDK on the development machine), so the job log should show the
+// tests executing, not just a bare "BUILD SUCCESSFUL".
+tasks.withType<Test>().configureEach {
+    testLogging {
+        events("passed", "failed", "skipped")
+    }
+}
