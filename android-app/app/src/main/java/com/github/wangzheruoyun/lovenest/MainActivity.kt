@@ -19,6 +19,7 @@ import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
@@ -116,6 +117,26 @@ class MainActivity : Activity() {
 
     /** Set by `onRenderProcessGone`; read by the heartbeat line as H1 evidence. */
     private var renderProcessGone = false
+
+    /* ---- Task 12 STALL detection ------------------------------------- */
+
+    /** Last `rafFired` seen by the watchdog; the differential's frozen half. */
+    private var lastRafFired = 0L
+
+    /** True once the engine has delivered at least one animation frame. */
+    private var rafFiredSeen = false
+
+    /** Consecutive samples where `rafFired` did not advance while `hb` did. */
+    private var rafStallSamples = 0
+
+    /** Last `hb`, so a STALL is only claimed while the page is demonstrably alive. */
+    private var lastHb = -1L
+
+    /** True once a STALL verdict has been reached for this session. */
+    private var stallReported = false
+
+    /** Guards `STALL` so exactly one record is written per session. */
+    private var stallRecordWritten = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -364,14 +385,104 @@ class MainActivity : Activity() {
             view.evaluateJavascript(HEARTBEAT_JS) { raw ->
                 heartbeatPending = false
                 val payload = unwrapJsonString(raw)
-                val hb = payload?.opt("hb")?.let { if (it === JSONObject.NULL) "?" else it.toString() } ?: "?"
-                val mem = payload?.optString("mem").orEmpty().ifEmpty { "null" }
-                log.log("NATIVE_HB t=$now hb=$hb cb=ok mem=$mem")
+                if (payload == null) {
+                    log.log("NATIVE_HB t=$now hb=? cb=ok mem=null counters=missing")
+                    return@evaluateJavascript
+                }
+                val hb = payload.optLong("hb", -1L)
+                val mem = payload.optString("mem").orEmpty().ifEmpty { "null" }
+                log.log(
+                    "NATIVE_HB t=$now hb=" + (if (hb < 0) "?" else hb.toString()) +
+                        " cb=ok mem=$mem" + heartbeatCounters(payload)
+                )
+                if (hb >= 0) detectStall(log, now, hb, payload)
             }
         } catch (e: Exception) {
             heartbeatPending = false
             log.log("NATIVE_HB t=$now cb=error detail=${e.javaClass.simpleName}")
         }
+    }
+
+    /**
+     * The Task 12 counters, appended to every `NATIVE_HB` line so the log itself
+     * carries the 甲/乙 decision without waiting for a STALL: `rafSched` climbing
+     * against a frozen `rafFired` is 甲, a frozen `rafSched` against a climbing
+     * `hb` is 乙, both climbing is "the engine is painting black".
+     */
+    private fun heartbeatCounters(payload: JSONObject): String =
+        " rafSched=" + payload.optLong("rafSched", -1L) +
+            " rafFired=" + payload.optLong("rafFired", -1L) +
+            " ctxLost=" + payload.optLong("ctxLost", -1L) +
+            " ctxRestored=" + payload.optLong("ctxRestored", -1L) +
+            " ctxCreateErr=" + payload.optLong("ctxCreateErr", -1L) +
+            " ctxLostPrevented=" + payload.optLong("ctxLostPrevented", -1L) +
+            " audPlay=" + payload.optLong("audPlay", -1L) +
+            " audioEl=" + payload.optLong("audioElements", -1L) +
+            " audioPaused=" + payload.optLong("audioPaused", -1L) +
+            " audioMaxT=" + payload.optDouble("audioMaxTime", -1.0) +
+            " audioEnded=" + payload.optLong("audioEnded", -1L) +
+            " audioCtx=" + payload.optString("audioContexts").ifEmpty { "[]" } +
+            " pend=" + payload.optLong("pend", -1L) +
+            " vis=" + payload.optString("visibility").ifEmpty { "unknown" }
+
+    /**
+     * H3 vs 甲/乙: once the engine has delivered a frame, three consecutive
+     * samples where `rafFired` does not advance while `hb` does are a `STALL`.
+     * The user cannot press anything on a black screen, so this fires on its own.
+     *
+     * The single `STALL` record embeds the page-side dump (`__gcDiagDump()`):
+     * pending request table, resource ring, audio state, canvas/GL facts. It is
+     * written once, either when the dump returns or, if the page never answers,
+     * with `dump=missing …` so the record still exists.
+     */
+    private fun detectStall(log: Diag, now: Long, hb: Long, payload: JSONObject) {
+        val rafFired = payload.optLong("rafFired", -1L)
+        if (rafFired >= 0) {
+            if (rafFired > lastRafFired) {
+                rafFiredSeen = true
+                rafStallSamples = 0
+            } else if (rafFiredSeen && hb > lastHb) {
+                rafStallSamples++
+            } else if (rafFiredSeen) {
+                // The heartbeat is not advancing either: that is H1/H2 death,
+                // not this instrument's case. Do not mislabel it as a STALL.
+                rafStallSamples = 0
+            }
+            lastRafFired = rafFired
+        }
+        lastHb = hb
+
+        if (!rafFiredSeen || rafStallSamples < STALL_SAMPLES || stallReported) return
+        stallReported = true
+        val counters = heartbeatCounters(payload) + " stalledSamples=" + rafStallSamples
+
+        val view = webView ?: run {
+            reportStall(log, now, counters, "no-webview")
+            return
+        }
+        var answered = false
+        try {
+            view.evaluateJavascript(DUMP_JS) { raw ->
+                answered = true
+                val data = unwrapJsonString(raw)?.toString() ?: "null"
+                reportStall(log, now, counters, data)
+            }
+        } catch (e: Exception) {
+            reportStall(log, now, counters, "error:${e.javaClass.simpleName}")
+            return
+        }
+        watchdogHandler?.postDelayed({
+            if (!answered) {
+                reportStall(log, now, counters, "missing (no answer in ${STALL_DUMP_TIMEOUT_MS}ms)")
+            }
+        }, STALL_DUMP_TIMEOUT_MS)
+    }
+
+    /** Write the one `STALL` record, guarded so the callback/timeout cannot double it. */
+    private fun reportStall(log: Diag, now: Long, counters: String, dump: String) {
+        if (stallRecordWritten) return
+        stallRecordWritten = true
+        log.log("STALL t=$now$counters dump=$dump")
     }
 
     /**
@@ -675,6 +786,9 @@ class MainActivity : Activity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        // Task 12: "Chromium thinks the page is occluded" must be excludable
+        // from the record, so the Activity's own focus state is on disk.
+        diag?.log("WINDOW_FOCUS hasFocus=$hasFocus")
         if (hasFocus) applyImmersive()
     }
 
@@ -757,6 +871,71 @@ class MainActivity : Activity() {
         }
         dispatchEscapeKey()
         confirmExit()
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Task 12 — volume keys (diagnostic build only)
+     *
+     * The Activity's key path is alive even when the page is not (the back key
+     * already proves it), and the WebView may otherwise eat a volume key. So
+     * the keys are intercepted here, before the view hierarchy:
+     *
+     *   volume-down → write the same dump `__gcDiagDump()` returns, immediately
+     *   volume-up   → simulate a WebGL context loss on the engine's canvas
+     *
+     * Both are acceptable **only in this diagnostic build** and must be removed
+     * before the final release. [CAPTURE_VOLUME_KEYS] is the single switch.
+     * ------------------------------------------------------------------ */
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (CAPTURE_VOLUME_KEYS && gameStarted && diag != null && webView != null &&
+            event.action == KeyEvent.ACTION_DOWN
+        ) {
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                    dumpOnDemand()
+                    return true
+                }
+
+                KeyEvent.KEYCODE_VOLUME_UP -> {
+                    // Ignore auto-repeat: one loss per press, not per repeat tick.
+                    if (event.repeatCount == 0) {
+                        simulateContextLoss()
+                        return true
+                    }
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    /** Volume-down: write the page dump to the log right now. */
+    private fun dumpOnDemand() {
+        val log = diag ?: return
+        val view = webView ?: return
+        log.log("DUMP source=volume-down")
+        try {
+            view.evaluateJavascript(DUMP_JS) { raw ->
+                val data = unwrapJsonString(raw)?.toString() ?: "null"
+                log.log("DUMP source=volume-down data=$data")
+            }
+        } catch (e: Exception) {
+            log.log("DUMP source=volume-down data=error:${e.javaClass.simpleName}")
+        }
+    }
+
+    /** Volume-up: ask the page to lose and restore the engine's WebGL context. */
+    private fun simulateContextLoss() {
+        val log = diag ?: return
+        val view = webView ?: return
+        log.log("CTXSIM requested source=volume-up")
+        try {
+            view.evaluateJavascript(LOSE_CONTEXT_JS) { raw ->
+                log.log("CTXSIM result=" + (raw?.trim('"') ?: "null"))
+            }
+        } catch (e: Exception) {
+            log.log("CTXSIM result=error:${e.javaClass.simpleName}")
+        }
     }
 
     /** Fire the synthetic Escape and forget about it. Never throws. */
@@ -882,6 +1061,31 @@ class MainActivity : Activity() {
         /** How long after `onPageFinished` the one-off WebGL probe runs. */
         const val WEBGL_PROBE_DELAY_MS = 1500L
 
+        /* ---- Task 12 STALL detection ---- */
+
+        /**
+         * Consecutive heartbeat samples where `rafFired` does not advance while
+         * `hb` does before the watchdog writes its single `STALL` record. The
+         * heartbeat runs every 2 s, so this is ~6 s of a frozen frame counter —
+         * long enough that a slow frame cannot be mistaken for a stall, short
+         * enough for one device run.
+         */
+        const val STALL_SAMPLES = 3
+
+        /** How long a STALL waits for the page's `__gcDiagDump()` before logging `missing`. */
+        const val STALL_DUMP_TIMEOUT_MS = 1500L
+
+        /**
+         * Task 12 diagnostic-build-only key capture: volume-down dumps the page
+         * state, volume-up simulates a WebGL context loss.
+         *
+         * This is acceptable **only** in this diagnostic build and must be
+         * switched off (or the `dispatchKeyEvent` override removed) before the
+         * final release, so the shipped app keeps the platform's volume
+         * behaviour. See the Task 12 report.
+         */
+        const val CAPTURE_VOLUME_KEYS = true
+
         /**
          * What `shouldInterceptRequest` prepends to `script.js` (Ruling C), plus
          * the Task 11 diagnostic opt-in. The flag must be set *before*
@@ -896,23 +1100,60 @@ class MainActivity : Activity() {
         const val SHIM_ASSET = "gc-bridge.js"
 
         /**
-         * One page round trip that yields both the heartbeat counter the shim
-         * increments every 250 ms and `performance.memory` when the WebView
-         * exposes it. The shim's counter is deliberately independent of the
-         * engine, so it keeps advancing if only the engine's own loop died.
+         * One page round trip that yields the heartbeat counter the shim
+         * increments every 250 ms, `performance.memory` when the WebView exposes
+         * it, and the Task 12 counters (rAF differential, context loss, audio,
+         * pending requests). The shim's counters are deliberately independent of
+         * the engine, so they keep advancing if only the engine's own loop died.
          */
         const val HEARTBEAT_JS = """
             (function () {
-              var hb = null;
-              var mem = null;
-              try { hb = window.__gcHeartbeat; } catch (e) {}
+              var out = { hb: null, mem: null };
+              try { out.hb = window.__gcHeartbeat; } catch (e) {}
               try {
                 if (window.performance && window.performance.memory) {
                   var m = window.performance.memory;
-                  mem = m.usedJSHeapSize + '/' + m.totalJSHeapSize + '/' + m.jsHeapSizeLimit;
+                  out.mem = m.usedJSHeapSize + '/' + m.totalJSHeapSize + '/' + m.jsHeapSizeLimit;
                 }
               } catch (e) {}
-              return JSON.stringify({ hb: hb, mem: mem });
+              try {
+                if (window.__gcDiagCounters) {
+                  var c = window.__gcDiagCounters();
+                  for (var k in c) {
+                    if (Object.prototype.hasOwnProperty.call(c, k)) out[k] = c[k];
+                  }
+                }
+              } catch (e) {}
+              return JSON.stringify(out);
+            })();
+        """
+
+        /**
+         * The on-demand dump: the pending request table, the resource ring
+         * buffer, audio state, canvas/GL facts and every counter, as one JSON
+         * string. Used by volume-down and by the STALL record.
+         */
+        const val DUMP_JS = """
+            (function () {
+              try {
+                if (window.__gcDiagDump) return window.__gcDiagDump();
+              } catch (e) {}
+              return null;
+            })();
+        """
+
+        /**
+         * Volume-up: lose the engine's WebGL context through
+         * `WEBGL_lose_context`, restore it after 2 s, and let the shim log what
+         * the engine does. A device-local reproduction loop for the black screen
+         * that does not need the scene transition.
+         */
+        const val LOSE_CONTEXT_JS = """
+            (function () {
+              try {
+                if (window.__gcDiagLoseContext) return window.__gcDiagLoseContext();
+              } catch (e) {}
+              return 'unavailable';
             })();
         """
 
@@ -925,8 +1166,12 @@ class MainActivity : Activity() {
             (function () {
               var out = { webgl: false, webgl2: false, vendor: null, renderer: null, error: null };
               try {
-                var canvas = document.createElement('canvas');
-                var gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                // A canvas that has already handed out a `webgl` context can
+                // never yield a `webgl2` one, so each context type gets its own
+                // canvas. (The old single-canvas probe always reported
+                // `webgl2:false` — that was this probe's bug, not the device's.)
+                var glCanvas = document.createElement('canvas');
+                var gl = glCanvas.getContext('webgl') || glCanvas.getContext('experimental-webgl');
                 out.webgl = !!gl;
                 if (gl) {
                   var ext = gl.getExtension('WEBGL_debug_renderer_info');
@@ -938,7 +1183,8 @@ class MainActivity : Activity() {
                     out.renderer = String(gl.getParameter(gl.RENDERER));
                   }
                 }
-                out.webgl2 = !!canvas.getContext('webgl2');
+                var gl2Canvas = document.createElement('canvas');
+                out.webgl2 = !!gl2Canvas.getContext('webgl2');
               } catch (e) {
                 out.error = String(e && e.message ? e.message : e);
               }
