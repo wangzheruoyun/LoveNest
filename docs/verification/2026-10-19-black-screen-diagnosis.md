@@ -224,3 +224,21 @@ node --test --test-name-pattern='onPC'              # 单测
   帧缓冲采样原因 `window.__gcDiagSampleCanvas('back-menu')`。
 - 菜单项「退出游戏」即等同旧确认框的同意项，因此不再二次确认；点菜单外或按返回键即取消。
 
+
+# 游戏目录写入越界修复（`v1.0.0-fix3`）
+
+`v1.0.0-fix2` 的真机验收通过后，按惯例复核游戏目录，发现引擎把存档、日志和「第四面墙」
+文案写进了**游戏根目录**（真机实证：5 个空目录 + 1 个被重写的 `《爱之巢》游戏攻略.txt`）。
+修复在 shim 里完成（写入重挂到 `Documents/` 镜像、读取游戏根优先），游戏目录已复原并与原始
+压缩包逐字节核对。完整记录见
+[`2026-10-19-game-folder-write-containment.md`](2026-10-19-game-folder-write-containment.md)。
+
+无头端到端（`transition-probe.js --seconds 25 --ua-mobile`；RED 就是 `v1.0.0-fix2` 里的 shim）：
+
+| shim | `[host:LEAK]` | landmark | pageerrors | `total REQ start` |
+|---|---|---|---|---|
+| `v1.0.0-fix2`（sha `41ad994e`） | 1（游戏根 `savedata`） | 全 false | 1 | 151 |
+| `v1.0.0-fix3`（sha `bafdb11f`） | 0 | 全 true | 0 | 205 |
+
+顺带一提：清理前那次「探针挂死 5 分钟」与本次修复无关，是同步 XHR 打到手机上由 App 建出来的
+空目录时 Chromium 的 `file://` 目录列举不返回；删掉那几个目录即消失（见上面链接的文档）。
