@@ -2,4 +2,20 @@
 <resources>
     <!-- Task 10 switches the launcher label to 爱之巢. -->
     <string name="app_name">Love Nest</string>
+
+    <!--
+      Gate screens. The app cannot run the game without "all files access" (to
+      read the user's own game folder in place) and without the folder itself, so
+      both cases are explained on screen rather than white-screening.
+    -->
+    <string name="gate_permission_title">需要“所有文件访问”权限</string>
+    <string name="gate_permission_message">《爱之巢》需要直接读取手机上的游戏文件夹，请授予“所有文件访问”权限，然后返回本应用，会自动继续。</string>
+    <string name="gate_permission_button">打开权限设置</string>
+    <string name="gate_missing_title">未找到游戏文件夹</string>
+    <string name="gate_missing_message">请把《爱之巢》Demo 文件夹放到：\n%1$s\n该文件夹里应当有 index.html。放好后点击下面的按钮重新检查。</string>
+    <string name="gate_missing_button">重新检查</string>
+    <string name="gate_settings_unavailable">无法打开权限设置页面，请到系统设置中手动授予“所有文件访问”权限。</string>
+
+    <!-- Ruling D: a silent platform-3 fallback is the worst outcome of the port. -->
+    <string name="bridge_missing">警告：游戏兼容层没有生效（%1$s），Meta 演出与文件存档已失效。游戏仍可运行，但结果不完整。</string>
 </resources>

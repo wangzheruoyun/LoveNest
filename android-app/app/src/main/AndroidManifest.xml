@@ -2,12 +2,29 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!--
-      Declared here; Task 7 wires the runtime grant flow for
-      MANAGE_EXTERNAL_STORAGE. SET_WALLPAPER is a normal permission and needs
-      no runtime prompt (design §5.6).
+      MANAGE_EXTERNAL_STORAGE is the one the runtime flow in MainActivity asks
+      for (Android 11+). It is what lets the app read the user's own game folder
+      in place, and the human partner explicitly declined a SAF fallback.
+      SET_WALLPAPER is a normal permission and needs no runtime prompt (§5.6).
+      VIBRATE backs the Meta performance's vibration (no runtime prompt either).
     -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.SET_WALLPAPER" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!--
+      On the 8.0-10 range that minSdk 26 claims, the same reach over /sdcard is
+      the legacy runtime grant instead. Capped at 29 so they never appear on the
+      target device (Android 14) or trigger the "all files access" workflow.
+      No INTERNET permission: the game's startup network calls are meant to fail
+      offline (design §7 risk 6).
+    -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
 
     <application
         android:allowBackup="false"

@@ -89,25 +89,33 @@ class DirectFileSource(root: File) : AssetSource {
         }
     }
 
-    override fun exists(path: String): Boolean = try {
-        File(resolve(path) ?: return false).exists()
-    } catch (_: Exception) {
-        false
-    }
-
-    override fun list(path: String): List<String>? = try {
-        File(resolve(path) ?: return null).list()?.toList()
-    } catch (_: Exception) {
-        null
-    }
-
-    override fun write(path: String, bytes: ByteArray): Boolean = try {
+    override fun exists(path: String): Boolean {
         val file = File(resolve(path) ?: return false)
-        file.parentFile?.mkdirs()
-        FileOutputStream(file).use { it.write(bytes) }
-        true
-    } catch (_: Exception) {
-        false
+        return try {
+            file.exists()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    override fun list(path: String): List<String>? {
+        val file = File(resolve(path) ?: return null)
+        return try {
+            file.list()?.toList()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    override fun write(path: String, bytes: ByteArray): Boolean {
+        val file = File(resolve(path) ?: return false)
+        return try {
+            file.parentFile?.mkdirs()
+            FileOutputStream(file).use { it.write(bytes) }
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private companion object {
