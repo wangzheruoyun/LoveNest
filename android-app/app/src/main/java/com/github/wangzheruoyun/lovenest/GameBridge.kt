@@ -125,14 +125,14 @@ class GameBridge(
 
     @JavascriptInterface
     fun readDir(path: String?): String {
-        val names = try {
-            File(resolve(path) ?: return "[]").list()
+        val entries = try {
+            resolve(path)?.list()
         } catch (_: Exception) {
             null
         } ?: return "[]"
         return try {
             val array = JSONArray()
-            for (name in names) array.put(name)
+            for (entry in entries) array.put(entry as Any)
             array.toString()
         } catch (_: Exception) {
             "[]"
@@ -204,7 +204,7 @@ class GameBridge(
         } catch (_: Exception) {
             null
         }
-        val name = if (!configured.isNullOrBlank()) configured else (Build.MODEL ?: "")
+        val name = configured?.takeIf { it.isNotBlank() } ?: (Build.MODEL ?: "")
         return asciiOnly(name)
     }
 
