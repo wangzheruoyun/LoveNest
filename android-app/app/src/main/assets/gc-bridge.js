@@ -852,6 +852,624 @@
   }
 
   /**
+   * `setTimeout` that works in both the WebView and the `node:vm` harness.
+   *
+   * In the browser `win.setTimeout` exists; in the harness it may only exist as
+   * a bare global. Never throws: instrumentation must not fail a page.
+   */
+  function diagSetTimeout(fn, ms) {
+    try {
+      if (win && typeof win.setTimeout === 'function') return win.setTimeout(fn, ms);
+    } catch (e) {}
+    try {
+      if (typeof setTimeout === 'function') return setTimeout(fn, ms);
+    } catch (e) {}
+    return null;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Task 12 — black-screen v2 probes
+   *
+   * Every probe below is installed only from `installDiagnostics()`, i.e. only
+   * when `window.__gcDiag === true`. With the flag absent this whole block is
+   * dead code: no global is replaced, no timer is armed, no line is written.
+   *
+   * The decisive measurement is the requestAnimationFrame differential:
+   *
+   *   rafSched — anything asked for a frame
+   *   rafFired — a frame callback was actually delivered
+   *
+   *   rafSched climbing, rafFired frozen  ⇒ 甲 (frame production stopped)
+   *   rafSched frozen,   hb climbing      ⇒ 乙 (the engine's loop stopped)
+   *   both climbing                        ⇒ the engine is painting black
+   * ------------------------------------------------------------------ */
+
+  /** Bounded ring of the most recent resource-timing entries. */
+  var DIAG_RESOURCE_RING = 200;
+
+  /** Resource timing is logged only above these thresholds, to avoid a flood. */
+  var DIAG_SLOW_MS = 500;
+  var DIAG_BIG_RESOURCE = 1024 * 1024;
+
+  var diagState = {
+    rafSched: 0,
+    rafFired: 0,
+    ctxLost: 0,
+    ctxRestored: 0,
+    ctxCreateErr: 0,
+    ctxLostPrevented: 0,
+    audPlay: 0,
+    audioContexts: [],
+    glContexts: [],
+    pending: {},
+    pendingSeq: 0,
+    pendingCount: 0,
+    resources: [],
+    factsLogged: false
+  };
+
+  /** Mark a canvas as having yielded a WebGL context, for the facts line. */
+  function diagCanvasSize(canvas) {
+    var w = 0;
+    var h = 0;
+    try { w = Number(canvas.width) || 0; } catch (e) {}
+    try { h = Number(canvas.height) || 0; } catch (e) {}
+    return { w: w, h: h };
+  }
+
+  /**
+   * Attach the three WebGL context events to one canvas, once per context.
+   *
+   * `webglcontextlost` deliberately does **not** call `preventDefault()`: this
+   * build observes the browser's default (non-recovering) behaviour, which is
+   * exactly the symptom under investigation. Instead it reads
+   * `event.defaultPrevented` one macrotask later, after the engine's own
+   * listeners have run, and records whether the engine intends to recover.
+   */
+  function diagAttachGlContext(canvas, ctx, type) {
+    var i;
+    for (i = 0; i < diagState.glContexts.length; i++) {
+      if (diagState.glContexts[i].ctx === ctx) return;
+    }
+    diagState.glContexts.push({ ctx: ctx, canvas: canvas, type: String(type || '') });
+    try { canvas.__gcDiagGl = true; } catch (e) {}
+
+    if (typeof canvas.addEventListener !== 'function') return;
+    try {
+      canvas.addEventListener('webglcontextlost', function (event) {
+        diagState.ctxLost++;
+        var size = diagCanvasSize(canvas);
+        diagWrite('CTX lost canvas=' + size.w + 'x' + size.h + ' type=' + type);
+        diagSetTimeout(function () {
+          var prevented = false;
+          try { prevented = !!(event && event.defaultPrevented); } catch (e) {}
+          if (prevented) diagState.ctxLostPrevented++;
+          diagWrite('CTX lost defaultPrevented=' + prevented);
+        }, 0);
+      }, false);
+      canvas.addEventListener('webglcontextrestored', function () {
+        diagState.ctxRestored++;
+        var size = diagCanvasSize(canvas);
+        diagWrite('CTX restored canvas=' + size.w + 'x' + size.h + ' type=' + type);
+      }, false);
+      canvas.addEventListener('webglcontextcreationerror', function (event) {
+        diagState.ctxCreateErr++;
+        var msg = '';
+        try { msg = (event && event.statusMessage) ? String(event.statusMessage) : ''; } catch (e) {}
+        diagWrite('CTX createerror message=' + msg);
+      }, false);
+    } catch (e) {
+      // A canvas that refuses listeners simply goes unobserved.
+    }
+  }
+
+  /** Hook `getContext` transparently: same arguments, same return value. */
+  function diagInstallContextProbe() {
+    var proto = null;
+    try { proto = win && win.HTMLCanvasElement && win.HTMLCanvasElement.prototype; } catch (e) {}
+    if (!proto || typeof proto.getContext !== 'function') return;
+    var originalGetContext = proto.getContext;
+    proto.getContext = function () {
+      var ctx = originalGetContext.apply(this, arguments);
+      try {
+        var type = arguments.length > 0 ? String(arguments[0]) : '';
+        if (ctx && (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2')) {
+          diagAttachGlContext(this, ctx, type);
+        }
+      } catch (e) {}
+      return ctx;
+    };
+  }
+
+  /** rAF wrapper: preserve `this`, the timestamp and the returned handle. */
+  function diagInstallRafProbe() {
+    if (!win || typeof win.requestAnimationFrame !== 'function') return;
+    var originalRaf = win.requestAnimationFrame;
+    win.requestAnimationFrame = function (callback) {
+      diagState.rafSched++;
+      if (typeof callback !== 'function') {
+        // Pass non-functions through untouched: whatever the platform did
+        // before (usually a TypeError) still happens, with the same arguments.
+        return originalRaf.call(win, callback);
+      }
+      var wrapped = function (timestamp) {
+        diagState.rafFired++;
+        return callback.call(this, timestamp);
+      };
+      return originalRaf.call(win, wrapped);
+    };
+  }
+
+  /** One `RAF_NEVER_USED` record if nothing schedules a frame in 10 s. */
+  function diagScheduleRafNeverUsed() {
+    var timer = diagSetTimeout(function () {
+      if (diagState.rafSched === 0) {
+        diagWrite('RAF_NEVER_USED t=' + diagNow());
+      }
+    }, 10000);
+    try { if (timer && typeof timer.unref === 'function') timer.unref(); } catch (e) {}
+  }
+
+  /** `state` of an AudioContext, or `unknown` when it cannot be read. */
+  function diagAudioState(ctx) {
+    try { return (ctx && ctx.state) ? String(ctx.state) : 'unknown'; } catch (e) { return 'unknown'; }
+  }
+
+  /**
+   * Keep every AudioContext the engine creates, and log when one appears.
+   * `AudioContext` is hooked without `Reflect.construct` (ES5): `Function.bind`
+   * builds a constructor that forwards the original arguments, and the wrapper
+   * returns the real context object, so `new` semantics are preserved.
+   */
+  function diagHookAudioContext(name) {
+    var Original = null;
+    try { Original = win[name]; } catch (e) {}
+    if (typeof Original !== 'function') return;
+    var Wrapped = function () {
+      var args = Array.prototype.slice.call(arguments);
+      var Bound = Original.bind.apply(Original, [null].concat(args));
+      var ctx = new Bound();
+      var i;
+      for (i = 0; i < diagState.audioContexts.length; i++) {
+        if (diagState.audioContexts[i] === ctx) return ctx;
+      }
+      diagState.audioContexts.push(ctx);
+      diagWrite('AUDIO context state=' + diagAudioState(ctx));
+      return ctx;
+    };
+    Wrapped.prototype = Original.prototype;
+    try { win[name] = Wrapped; } catch (e) {}
+  }
+
+  /** Count `play()` calls; an audio start is otherwise invisible page-side. */
+  function diagInstallAudioProbe() {
+    try {
+      var proto = win && win.HTMLMediaElement && win.HTMLMediaElement.prototype;
+      if (proto && typeof proto.play === 'function') {
+        var originalPlay = proto.play;
+        proto.play = function () {
+          diagState.audPlay++;
+          var src = '';
+          try { src = String(this.currentSrc || this.src || ''); } catch (e) {}
+          diagWrite('AUDIO play calls=' + diagState.audPlay + ' src=' + src);
+          return originalPlay.apply(this, arguments);
+        };
+      }
+    } catch (e) {}
+    diagHookAudioContext('AudioContext');
+    diagHookAudioContext('webkitAudioContext');
+  }
+
+  /** Audio liveness sampled at every heartbeat (and in a STALL dump). */
+  function diagAudioFacts() {
+    var out = { elements: 0, paused: 0, maxTime: 0, ended: 0, contexts: [] };
+    try {
+      var nodes = (win.document && win.document.querySelectorAll) ?
+        win.document.querySelectorAll('audio, video') : null;
+      for (var i = 0; nodes && i < nodes.length; i++) {
+        var el = nodes[i];
+        out.elements++;
+        try { if (el.paused) out.paused++; } catch (e) {}
+        try { if (el.ended) out.ended++; } catch (e) {}
+        try {
+          var t = Number(el.currentTime);
+          if (!isNaN(t) && t > out.maxTime) out.maxTime = t;
+        } catch (e) {}
+      }
+    } catch (e) {}
+    for (var j = 0; j < diagState.audioContexts.length; j++) {
+      out.contexts.push(diagAudioState(diagState.audioContexts[j]));
+    }
+    return out;
+  }
+
+  /** Byte count of any `diagBytesOf`-able response shape. */
+  function diagBytesOf(value) {
+    if (value === null || value === undefined) return -1;
+    try {
+      if (typeof value === 'string') return value.length;
+      if (typeof value.byteLength === 'number') return value.byteLength;
+      if (typeof value.size === 'number') return value.size;
+      if (typeof value.length === 'number') return value.length;
+    } catch (e) {}
+    return -1;
+  }
+
+  /**
+   * Completed-XHR byte count without assuming a response shape. `responseText`
+   * throws for `arraybuffer`/`blob`; `status` can throw on a torn-down request.
+   */
+  function diagXhrBytes(xhr) {
+    try {
+      var type = String(xhr.responseType || '');
+      if (type === 'arraybuffer' || type === 'blob') return diagBytesOf(xhr.response);
+      return diagBytesOf(xhr.responseText);
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  function diagStartPending(kind, url, method) {
+    var id = ++diagState.pendingSeq;
+    diagState.pending[id] = {
+      kind: kind,
+      method: String(method || ''),
+      url: String(url || ''),
+      startedAt: diagNow()
+    };
+    diagState.pendingCount++;
+    diagWrite('REQ start id=' + id + ' kind=' + kind +
+      (method ? ' method=' + String(method) : '') + ' url=' + String(url || ''));
+    return id;
+  }
+
+  function diagFinishPending(id, ok, status, bytes, err) {
+    var req = diagState.pending[id];
+    if (!req) return;
+    diagState.pending[id] = null;
+    try { delete diagState.pending[id]; } catch (e) {}
+    if (diagState.pendingCount > 0) diagState.pendingCount--;
+    var line = 'REQ done id=' + id + ' kind=' + req.kind + ' ok=' + ok +
+      ' status=' + status + ' bytes=' + bytes + ' ms=' + (diagNow() - req.startedAt);
+    if (err) line += ' err=' + err;
+    line += ' url=' + req.url;
+    diagWrite(line);
+  }
+
+  /** XHR tracing: `open` records, `send` starts a pending entry, `loadend` ends it. */
+  function diagInstallXhrProbe() {
+    var XHR = null;
+    try { XHR = win && win.XMLHttpRequest; } catch (e) {}
+    if (!XHR || !XHR.prototype) return;
+    var proto = XHR.prototype;
+    var originalOpen = proto.open;
+    var originalSend = proto.send;
+    if (typeof originalOpen !== 'function' || typeof originalSend !== 'function') return;
+
+    proto.open = function (method, url) {
+      try {
+        this.__gcDiagMethod = String(method == null ? '' : method);
+        this.__gcDiagUrl = String(url == null ? '' : url);
+        this.__gcDiagId = 0;
+        this.__gcDiagError = '';
+      } catch (e) {}
+      return originalOpen.apply(this, arguments);
+    };
+
+    proto.send = function () {
+      var self = this;
+      var id = 0;
+      try {
+        id = diagStartPending('xhr', this.__gcDiagUrl || '', this.__gcDiagMethod || '');
+        this.__gcDiagId = id;
+      } catch (e) {}
+
+      try {
+        if (typeof this.addEventListener === 'function' && !this.__gcDiagWired) {
+          this.__gcDiagWired = true;
+          this.addEventListener('error', function () {
+            try { self.__gcDiagError = 'error'; } catch (e) {}
+          }, false);
+          this.addEventListener('timeout', function () {
+            try { self.__gcDiagError = 'timeout'; } catch (e) {}
+          }, false);
+          this.addEventListener('abort', function () {
+            try { self.__gcDiagError = 'abort'; } catch (e) {}
+          }, false);
+          this.addEventListener('loadend', function () {
+            var reqId = 0;
+            try { reqId = self.__gcDiagId; } catch (e) {}
+            if (!reqId) return;
+            var status = 0;
+            try { status = Number(self.status) || 0; } catch (e) {}
+            var err = '';
+            try { err = self.__gcDiagError || ''; } catch (e) {}
+            // `file://` XHR reports status 0 on success, so 0 alone is not an
+            // error; only an explicit error/timeout/abort event is.
+            var ok = !err && (status === 0 || (status >= 200 && status < 400));
+            diagFinishPending(reqId, ok, status, diagXhrBytes(self), err);
+            try { self.__gcDiagId = 0; } catch (e) {}
+          }, false);
+        }
+      } catch (e) {}
+
+      try {
+        return originalSend.apply(this, arguments);
+      } catch (e) {
+        if (id) diagFinishPending(id, false, 0, -1, (e && e.name) ? String(e.name) : 'throw');
+        throw e;
+      }
+    };
+  }
+
+  /** `fetch` tracing: same promise semantics, with a pending entry around it. */
+  function diagInstallFetchProbe() {
+    if (!win || typeof win.fetch !== 'function') return;
+    var originalFetch = win.fetch;
+    win.fetch = function (input) {
+      var url = '';
+      try {
+        if (typeof input === 'string') url = input;
+        else if (input && typeof input.url === 'string') url = input.url;
+      } catch (e) {}
+      var id = diagStartPending('fetch', url, '');
+      var promise;
+      try {
+        promise = originalFetch.apply(win, arguments);
+      } catch (e) {
+        diagFinishPending(id, false, 0, -1, (e && e.name) ? String(e.name) : 'throw');
+        throw e;
+      }
+      if (!promise || typeof promise.then !== 'function') return promise;
+      return promise.then(function (response) {
+        var status = 0;
+        var bytes = -1;
+        try { status = Number(response && response.status) || 0; } catch (e) {}
+        try {
+          if (response && response.headers && typeof response.headers.get === 'function') {
+            var length = response.headers.get('content-length');
+            if (length !== null && length !== undefined) {
+              var n = Number(length);
+              if (!isNaN(n)) bytes = n;
+            }
+          }
+        } catch (e) {}
+        diagFinishPending(id, true, status, bytes, '');
+        return response;
+      }, function (error) {
+        diagFinishPending(id, false, 0, -1, (error && error.name) ? String(error.name) : 'reject');
+        throw error;
+      });
+    };
+  }
+
+  /** Append one resource entry to the bounded ring, log only if it is big/slow. */
+  function diagRecordResource(entry) {
+    var item = { name: '', type: '', start: 0, duration: 0, size: -1 };
+    try { item.name = String(entry.name || ''); } catch (e) {}
+    try { item.type = String(entry.initiatorType || ''); } catch (e) {}
+    try { item.start = Number(entry.startTime) || 0; } catch (e) {}
+    try { item.duration = Number(entry.duration) || 0; } catch (e) {}
+    try {
+      item.size = Number(entry.transferSize);
+      if (isNaN(item.size)) item.size = -1;
+    } catch (e) { item.size = -1; }
+
+    diagState.resources.push(item);
+    while (diagState.resources.length > DIAG_RESOURCE_RING) diagState.resources.shift();
+
+    if (item.duration > DIAG_SLOW_MS || item.size > DIAG_BIG_RESOURCE) {
+      diagWrite('RES type=' + item.type + ' dur=' + item.duration + ' size=' + item.size +
+        ' start=' + item.start + ' name=' + item.name);
+    }
+  }
+
+  function diagInstallPerformanceProbe() {
+    var Observer = null;
+    try { Observer = win && win.PerformanceObserver; } catch (e) {}
+    if (typeof Observer !== 'function') return;
+    try {
+      var observer = new Observer(function (list) {
+        try {
+          var entries = list.getEntries();
+          for (var i = 0; i < entries.length; i++) diagRecordResource(entries[i]);
+        } catch (e) {}
+      });
+      try {
+        observer.observe({ type: 'resource', buffered: true });
+      } catch (e1) {
+        // Older implementations reject the `type` form; `entryTypes` still
+        // works, just without `buffered`.
+        try { observer.observe({ entryTypes: ['resource'] }); } catch (e2) {}
+      }
+    } catch (e) {}
+  }
+
+  function diagCanvasFacts() {
+    var out = [];
+    try {
+      var nodes = (win.document && win.document.getElementsByTagName) ?
+        win.document.getElementsByTagName('canvas') : null;
+      for (var i = 0; nodes && i < nodes.length; i++) {
+        var canvas = nodes[i];
+        var size = diagCanvasSize(canvas);
+        var isGl = false;
+        var type = '';
+        try { isGl = !!canvas.__gcDiagGl; } catch (e) {}
+        for (var j = 0; j < diagState.glContexts.length; j++) {
+          if (diagState.glContexts[j].canvas === canvas) {
+            type = diagState.glContexts[j].type;
+            break;
+          }
+        }
+        out.push({ width: size.w, height: size.h, webgl: isGl, context: type });
+      }
+    } catch (e) {}
+    return out;
+  }
+
+  function diagGlLimits() {
+    var out = { maxTexture: -1, maxRenderbuffer: -1, maxTextureUnits: -1 };
+    if (diagState.glContexts.length === 0) return out;
+    var gl = diagState.glContexts[0].ctx;
+    try { out.maxTexture = Number(gl.getParameter(gl.MAX_TEXTURE_SIZE)); } catch (e) {}
+    try { out.maxRenderbuffer = Number(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE)); } catch (e) {}
+    try { out.maxTextureUnits = Number(gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS)); } catch (e) {}
+    return out;
+  }
+
+  function diagPageFacts() {
+    var out = {
+      dpr: 1,
+      innerWidth: 0,
+      innerHeight: 0,
+      visibility: 'unknown',
+      canvases: diagCanvasFacts(),
+      gl: diagGlLimits()
+    };
+    try { out.dpr = Number(win.devicePixelRatio) || 1; } catch (e) {}
+    try { out.innerWidth = Number(win.innerWidth) || 0; } catch (e) {}
+    try { out.innerHeight = Number(win.innerHeight) || 0; } catch (e) {}
+    try { out.visibility = String(win.document.visibilityState || 'unknown'); } catch (e) {}
+    return out;
+  }
+
+  /**
+   * The page facts the fix decision needs, logged once (at `load`, or at +10 s
+   * if `load` never fires). A STALL record carries the same facts again.
+   */
+  function diagLogFacts(reason) {
+    if (diagState.factsLogged) return;
+    diagState.factsLogged = true;
+    var facts = diagPageFacts();
+    var gl = facts.gl;
+    diagWrite('FACTS why=' + reason + ' dpr=' + facts.dpr +
+      ' inner=' + facts.innerWidth + 'x' + facts.innerHeight +
+      ' vis=' + facts.visibility +
+      ' canvases=' + JSON.stringify(facts.canvases) +
+      ' maxTexture=' + gl.maxTexture +
+      ' maxRenderbuffer=' + gl.maxRenderbuffer +
+      ' maxTextureUnits=' + gl.maxTextureUnits);
+  }
+
+  /** The compact counter object polled by the native heartbeat. */
+  function diagCounters() {
+    var audio = diagAudioFacts();
+    var out = {
+      rafSched: diagState.rafSched,
+      rafFired: diagState.rafFired,
+      ctxLost: diagState.ctxLost,
+      ctxRestored: diagState.ctxRestored,
+      ctxCreateErr: diagState.ctxCreateErr,
+      ctxLostPrevented: diagState.ctxLostPrevented,
+      audPlay: diagState.audPlay,
+      pend: diagState.pendingCount,
+      audioElements: audio.elements,
+      audioPaused: audio.paused,
+      audioMaxTime: audio.maxTime,
+      audioEnded: audio.ended,
+      audioContexts: audio.contexts,
+      visibility: 'unknown'
+    };
+    try { out.visibility = String(win.document.visibilityState || 'unknown'); } catch (e) {}
+    return out;
+  }
+
+  function diagPendingList() {
+    var out = [];
+    for (var key in diagState.pending) {
+      if (!Object.prototype.hasOwnProperty.call(diagState.pending, key)) continue;
+      var req = diagState.pending[key];
+      if (!req) continue;
+      out.push({
+        id: Number(key),
+        kind: req.kind,
+        method: req.method,
+        url: req.url,
+        ms: diagNow() - req.startedAt
+      });
+    }
+    return out;
+  }
+
+  /** The full on-demand payload: counters, page facts, pending table, ring. */
+  function diagDump() {
+    var out = {
+      t: diagNow(),
+      counters: diagCounters(),
+      page: diagPageFacts(),
+      pending: diagPendingList(),
+      resources: diagState.resources.slice(0)
+    };
+    var text;
+    try {
+      text = JSON.stringify(out);
+    } catch (e) {
+      text = '{"error":"dump failed"}';
+    }
+    return text;
+  }
+
+  /**
+   * Volume-up hook: lose the engine's largest WebGL context, restore it 2 s
+   * later. This build only *observes* what the engine does in between; it does
+   * not try to help it recover.
+   */
+  function diagLoseContext() {
+    var target = null;
+    var bestArea = -1;
+    for (var i = 0; i < diagState.glContexts.length; i++) {
+      var item = diagState.glContexts[i];
+      var size = diagCanvasSize(item.canvas);
+      var area = size.w * size.h;
+      if (area > bestArea) {
+        bestArea = area;
+        target = item;
+      }
+    }
+    if (!target) return 'no-webgl';
+    var ext = null;
+    try { ext = target.ctx.getExtension('WEBGL_lose_context'); } catch (e) {}
+    if (!ext || typeof ext.loseContext !== 'function') return 'no-extension';
+    try {
+      ext.loseContext();
+      var tsize = diagCanvasSize(target.canvas);
+      diagWrite('CTXSIM lost type=' + target.type + ' canvas=' + tsize.w + 'x' + tsize.h);
+    } catch (e) {
+      return 'lose-failed:' + ((e && e.name) ? String(e.name) : 'error');
+    }
+    diagSetTimeout(function () {
+      try {
+        if (typeof ext.restoreContext === 'function') {
+          ext.restoreContext();
+          diagWrite('CTXSIM restored');
+        }
+      } catch (e) {
+        diagWrite('CTXSIM restore-failed ' + ((e && e.name) ? String(e.name) : 'error'));
+      }
+    }, 2000);
+    return 'lost';
+  }
+
+  function diagInstallVisibilityProbe() {
+    try {
+      if (win.document && typeof win.document.addEventListener === 'function') {
+        win.document.addEventListener('visibilitychange', function () {
+          var state = 'unknown';
+          try { state = String(win.document.visibilityState || 'unknown'); } catch (e) {}
+          diagWrite('VIS visibility=' + state);
+        }, false);
+      }
+    } catch (e) {}
+    try {
+      if (typeof win.addEventListener === 'function') {
+        win.addEventListener('focus', function () { diagWrite('VIS focus'); }, false);
+        win.addEventListener('blur', function () { diagWrite('VIS blur'); }, false);
+      }
+    } catch (e) {}
+  }
+
+  /**
    * Install the page-side liveness probe, once, when the flag is set:
    *
    *  - `window.__gcHeartbeat++` every 250 ms, which the native watchdog polls
@@ -916,7 +1534,31 @@
       // A host without addEventListener gets no page-side error capture.
     }
 
-    diagWrite('DIAG on heartbeat=250ms flag=__gcDiag');
+    /* ---- Task 12 probes: all of them are no-ops unless we got here ---- */
+    try { diagInstallRafProbe(); } catch (e) {}
+    try { diagInstallContextProbe(); } catch (e) {}
+    try { diagInstallAudioProbe(); } catch (e) {}
+    try { diagInstallXhrProbe(); } catch (e) {}
+    try { diagInstallFetchProbe(); } catch (e) {}
+    try { diagInstallPerformanceProbe(); } catch (e) {}
+    try { diagInstallVisibilityProbe(); } catch (e) {}
+
+    // Page facts once the engine has had a chance to build its canvas.
+    try {
+      if (typeof win.addEventListener === 'function') {
+        win.addEventListener('load', function () { diagLogFacts('load'); }, false);
+      }
+    } catch (e) {}
+    diagScheduleRafNeverUsed();
+    var factsTimer = diagSetTimeout(function () { diagLogFacts('t+10s'); }, 10000);
+    try { if (factsTimer && typeof factsTimer.unref === 'function') factsTimer.unref(); } catch (e) {}
+
+    // The two on-demand entry points the Activity's volume keys call.
+    win.__gcDiagDump = diagDump;
+    win.__gcDiagCounters = diagCounters;
+    win.__gcDiagLoseContext = diagLoseContext;
+
+    diagWrite('DIAG on heartbeat=250ms flag=__gcDiag pack=v2');
   }
 
   /**

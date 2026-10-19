@@ -6,6 +6,12 @@ const { createHost } = require('./host-native');
 
 const GAME_ROOT = '/storage/emulated/0/Download/爱之巢DemoV1.52';
 
+// The default is the committed shim. `GC_BRIDGE_UNDER_TEST` exists only so the
+// Task 12 RED run can execute the same tests against the *previous* shim (the
+// file from `git show HEAD:…`), proving the new tests fail before the change.
+const BRIDGE_PATH = process.env.GC_BRIDGE_UNDER_TEST ||
+  '../../android-app/app/src/main/assets/gc-bridge.js';
+
 function loadBridge(host, windowProps) {
   const sandbox = { window: {}, console, __GCNative: host, setTimeout, clearTimeout, Date, JSON, Math };
   // Optional extra `window` properties (Task 11 uses this to set `__gcDiag`).
@@ -14,7 +20,7 @@ function loadBridge(host, windowProps) {
   sandbox.window.window = sandbox.window;
   sandbox.globalThis = sandbox.window;
   vm.createContext(sandbox);
-  vm.runInContext(fs.readFileSync('../../android-app/app/src/main/assets/gc-bridge.js', 'utf8'), sandbox);
+  vm.runInContext(fs.readFileSync(BRIDGE_PATH, 'utf8'), sandbox);
   return sandbox.window;
 }
 
@@ -1165,4 +1171,340 @@ test('__gcDiag 关闭时不安装心跳、不注册监听（只能观测，不�
   assert.strictEqual(listeners, 0, '关闭时不得注册错误监听');
   assert.strictEqual(typeof w.__gcHeartbeat, 'undefined');
   assert.deepStrictEqual(lines.filter((s) => DIAG_LINE.test(s)), []);
+});
+
+/* ------------------------------------------------------------------ *
+ * Task 12 — black-screen diagnostics v2 (`window.__gcDiag`)
+ *
+ * These tests pin the two load-bearing properties:
+ *   1. flag off  → the rAF/context/audio/XHR probes are not installed at all;
+ *   2. flag on   → the counters mean what the STALL decision tree says.
+ * The rAF wrapper's `this`/timestamp/handle preservation is tested explicitly
+ * because a well-meaning wrapper that loses any of them perturbs the engine.
+ * ------------------------------------------------------------------ */
+
+const V2_LINE = /^(RAF_NEVER_USED|FACTS|REQ |RES |CTX |CTXSIM|AUDIO |VIS )/;
+
+function makeFakeGl() {
+  return {
+    MAX_TEXTURE_SIZE: 0x0d33,
+    MAX_RENDERBUFFER_SIZE: 0x84e8,
+    MAX_TEXTURE_IMAGE_UNITS: 0x8872,
+    getParameter(p) {
+      if (p === 0x0d33) return 8192;
+      if (p === 0x84e8) return 4096;
+      if (p === 0x8872) return 16;
+      return null;
+    },
+    getExtension(name) {
+      if (name === 'WEBGL_lose_context') {
+        return { loseContext() {}, restoreContext() {} };
+      }
+      return null;
+    }
+  };
+}
+
+function makeFakeCanvasClass() {
+  function Canvas() {
+    this.width = 320;
+    this.height = 180;
+    this.listeners = {};
+    this._gl = makeFakeGl();
+  }
+  Canvas.prototype.getContext = function (type) {
+    if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') return this._gl;
+    return null;
+  };
+  Canvas.prototype.addEventListener = function (type, fn) {
+    (this.listeners[type] || (this.listeners[type] = [])).push(fn);
+  };
+  return Canvas;
+}
+
+function makeFakeXhrClass() {
+  function Xhr() {
+    this.listeners = {};
+    this.status = 0;
+    this.responseText = '';
+    this.responseType = '';
+  }
+  Xhr.prototype.open = function (method, url) {
+    this.method = method;
+    this.url = url;
+  };
+  Xhr.prototype.send = function () { this.sent = true; };
+  Xhr.prototype.addEventListener = function (type, fn) {
+    (this.listeners[type] || (this.listeners[type] = [])).push(fn);
+  };
+  Xhr.prototype.emit = function (type) {
+    (this.listeners[type] || []).forEach((fn) => fn());
+  };
+  return Xhr;
+}
+
+test('__gcDiag 关闭时不安装 rAF 钩子、不暴露 v2 入口、不产生 v2 日志', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const raf = (cb) => { void cb; return 41; };
+  const caf = () => {};
+  const w = loadBridge(host, { requestAnimationFrame: raf, cancelAnimationFrame: caf });
+
+  assert.strictEqual(w.requestAnimationFrame, raf, '关闭时 rAF 必须是原函数本身');
+  assert.strictEqual(w.cancelAnimationFrame, caf);
+  assert.strictEqual(typeof w.__gcDiagDump, 'undefined');
+  assert.strictEqual(typeof w.__gcDiagCounters, 'undefined');
+  assert.strictEqual(typeof w.__gcDiagLoseContext, 'undefined');
+  assert.deepStrictEqual(lines.filter((s) => V2_LINE.test(s)), [],
+    '关闭时不得出现任何 Task 12 诊断行');
+});
+
+test('__gcDiag 开启时 rafSched 立即计数，rafFired 仅在回调真正执行时计数', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  diagLines(host);
+  const callbacks = [];
+  const raf = (cb) => { callbacks.push(cb); return callbacks.length; };
+  const caf = () => {};
+  const w = loadBridge(host, {
+    __gcDiag: true,
+    requestAnimationFrame: raf,
+    cancelAnimationFrame: caf
+  });
+
+  let observedThis = null;
+  let observedTs = null;
+  const handle = w.requestAnimationFrame(function (ts) {
+    observedThis = this;
+    observedTs = ts;
+    return 'callback-result';
+  });
+  assert.strictEqual(handle, 1, '必须返回原始句柄，cancelAnimationFrame 才能继续工作');
+  assert.strictEqual(w.cancelAnimationFrame, caf, 'cancelAnimationFrame 不得被替换');
+  assert.strictEqual(w.__gcDiagCounters().rafSched, 1, '请求一帧就必须计入 rafSched');
+  assert.strictEqual(w.__gcDiagCounters().rafFired, 0, '回调未执行时 rafFired 必须为 0');
+
+  const marker = { tag: 'this-marker' };
+  const result = callbacks[0].call(marker, 123.5);
+  assert.strictEqual(result, 'callback-result');
+  assert.strictEqual(observedThis, marker, '包装必须保留回调的 this');
+  assert.strictEqual(observedTs, 123.5, '包装必须原样传递 timestamp');
+  assert.strictEqual(w.__gcDiagCounters().rafFired, 1);
+});
+
+test('rAF 包装对非函数参数原样透传（不吞掉、不改写）', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  diagLines(host);
+  let seen = 'not-called';
+  const raf = (cb) => { seen = cb; return 7; };
+  const w = loadBridge(host, { __gcDiag: true, requestAnimationFrame: raf });
+
+  const handle = w.requestAnimationFrame(undefined);
+  assert.strictEqual(handle, 7);
+  assert.strictEqual(seen, undefined, '非函数实参必须原样交给原始 rAF');
+  assert.strictEqual(w.__gcDiagCounters().rafSched, 1);
+});
+
+test('合成 webglcontextlost 递增 ctxLost，且本探针自己不调用 preventDefault', async () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const Canvas = makeFakeCanvasClass();
+  const w = loadBridge(host, { __gcDiag: true, HTMLCanvasElement: Canvas });
+
+  const canvas = new w.HTMLCanvasElement();
+  const gl = canvas.getContext('webgl');
+  assert.ok(gl);
+  const handlers = canvas.listeners['webglcontextlost'];
+  assert.strictEqual(handlers.length, 1, '每个 WebGL canvas 必须挂一个丢失监听');
+
+  const event = {
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; }
+  };
+  handlers[0](event);
+  assert.strictEqual(w.__gcDiagCounters().ctxLost, 1);
+  assert.strictEqual(event.defaultPrevented, false, '观测构建不得替引擎 preventDefault');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(lines.some((s) => s === 'CTX lost defaultPrevented=false'),
+    'setTimeout(0) 之后必须落一条 defaultPrevented 记录');
+});
+
+test('引擎在后续监听里 preventDefault 时，记录 defaultPrevented=true', async () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const Canvas = makeFakeCanvasClass();
+  const w = loadBridge(host, { __gcDiag: true, HTMLCanvasElement: Canvas });
+
+  const canvas = new w.HTMLCanvasElement();
+  canvas.getContext('webgl');
+  // Registration order mirrors the device: our hook runs first, engine's later.
+  canvas.addEventListener('webglcontextlost', (e) => e.preventDefault());
+  const event = {
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; }
+  };
+  // Dispatch every listener in registration order, as the browser would.
+  canvas.listeners['webglcontextlost'].forEach((fn) => fn(event));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.strictEqual(w.__gcDiagCounters().ctxLostPrevented, 1);
+  assert.ok(lines.some((s) => s === 'CTX lost defaultPrevented=true'));
+});
+
+test('XHR 挂起表在 send 后有条目，loadend 后条目被删除并记录字节数', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const Xhr = makeFakeXhrClass();
+  const w = loadBridge(host, { __gcDiag: true, XMLHttpRequest: Xhr });
+
+  const xhr = new w.XMLHttpRequest();
+  xhr.open('GET', 'file:///asset/json/startup.json');
+  xhr.send();
+  assert.strictEqual(w.__gcDiagCounters().pend, 1, 'send 后必须出现一条挂起记录');
+  const before = JSON.parse(w.__gcDiagDump());
+  assert.strictEqual(before.pending.length, 1);
+  assert.strictEqual(before.pending[0].kind, 'xhr');
+  assert.strictEqual(before.pending[0].method, 'GET');
+  assert.strictEqual(before.pending[0].url, 'file:///asset/json/startup.json');
+
+  xhr.status = 0; // file:// success
+  xhr.responseText = '{"ok":true}';
+  xhr.emit('loadend');
+  assert.strictEqual(w.__gcDiagCounters().pend, 0, 'loadend 后条目必须消失');
+  assert.deepStrictEqual(JSON.parse(w.__gcDiagDump()).pending, []);
+  const done = lines.filter((s) => s.indexOf('REQ done ') === 0);
+  assert.strictEqual(done.length, 1);
+  assert.ok(/ ok=true status=0 bytes=11 ms=\d+ url=file:\/\/\/asset\/json\/startup\.json$/.test(done[0]),
+    '完成行必须带实际字节数：' + done[0]);
+});
+
+test('XHR 的奇怪响应形状不会让字节统计抛异常', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const Xhr = makeFakeXhrClass();
+  const w = loadBridge(host, { __gcDiag: true, XMLHttpRequest: Xhr });
+
+  const xhr = new w.XMLHttpRequest();
+  xhr.open('GET', 'file:///blob.bin');
+  xhr.send();
+  xhr.status = 200;
+  xhr.responseType = 'arraybuffer';
+  xhr.response = { byteLength: 123 };
+  Object.defineProperty(xhr, 'responseText', {
+    get() { throw new Error('InvalidStateError'); }
+  });
+  assert.doesNotThrow(() => xhr.emit('loadend'));
+  const done = lines.filter((s) => s.indexOf('REQ done ') === 0);
+  assert.ok(/ bytes=123 /.test(done[0]), 'arraybuffer 必须按 byteLength 计数：' + done[0]);
+});
+
+test('资源计时只记录慢/大的条目，环形缓冲上限 200', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  let observerCallback = null;
+  function Observer(cb) {
+    observerCallback = cb;
+    this.observe = () => {};
+  }
+  const w = loadBridge(host, { __gcDiag: true, PerformanceObserver: Observer });
+  assert.strictEqual(typeof observerCallback, 'function');
+
+  const entries = [];
+  for (let i = 0; i < 205; i++) {
+    entries.push({ name: 'file:///a' + i, initiatorType: 'xmlhttprequest', startTime: i, duration: 1, transferSize: 10 });
+  }
+  entries.push({ name: 'file:///slow', initiatorType: 'xmlhttprequest', startTime: 9, duration: 600, transferSize: 10 });
+  observerCallback({ getEntries: () => entries });
+
+  const dump = JSON.parse(w.__gcDiagDump());
+  assert.strictEqual(dump.resources.length, 200, '环形缓冲必须有界');
+  assert.strictEqual(dump.resources[dump.resources.length - 1].name, 'file:///slow',
+    '最新条目必须保留');
+  const res = lines.filter((s) => s.indexOf('RES ') === 0);
+  assert.strictEqual(res.length, 1, '只有超过 500ms / 1MB 的条目才写行');
+  assert.ok(/ dur=600 /.test(res[0]));
+});
+
+test('AudioContext/play 与心跳音频采样反映真实状态', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  diagLines(host);
+  function FakeAudioContext() { this.state = 'suspended'; }
+  function FakeMedia() {
+    this.paused = false;
+    this.ended = false;
+    this.currentTime = 2.5;
+    this.src = 'file:///a.ogg';
+  }
+  FakeMedia.prototype.play = function () { return 'played'; };
+  const media = [new FakeMedia()];
+  const document = {
+    visibilityState: 'visible',
+    addEventListener() {},
+    querySelectorAll(sel) { return sel === 'audio, video' ? media : []; },
+    getElementsByTagName() { return []; }
+  };
+  const w = loadBridge(host, {
+    __gcDiag: true,
+    AudioContext: FakeAudioContext,
+    HTMLMediaElement: FakeMedia,
+    document
+  });
+
+  const ctx = new w.AudioContext();
+  assert.ok(ctx instanceof FakeAudioContext);
+  assert.strictEqual(media[0].play(), 'played');
+  const c = w.__gcDiagCounters();
+  assert.strictEqual(c.audPlay, 1);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(c.audioContexts)), ['suspended']);
+  assert.strictEqual(c.audioElements, 1);
+  assert.strictEqual(c.audioPaused, 0);
+  assert.strictEqual(c.audioMaxTime, 2.5);
+  assert.strictEqual(c.audioEnded, 0);
+});
+
+test('10 秒内没有任何 rAF 请求时写一条 RAF_NEVER_USED', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const timers = [];
+  const w = loadBridge(host, {
+    __gcDiag: true,
+    setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; }
+  });
+  void w;
+  const rafTimer = timers.find((t) => t.ms === 10000);
+  assert.ok(rafTimer, '必须安排 10 秒检查');
+  rafTimer.fn();
+  assert.ok(lines.some((s) => /^RAF_NEVER_USED t=\d+$/.test(s)));
+});
+
+test('页面事实行包含 dpr/尺寸/可见性/画布/GL 上限', () => {
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  const lines = diagLines(host);
+  const Canvas = makeFakeCanvasClass();
+  const canvas = new Canvas();
+  const document = {
+    visibilityState: 'visible',
+    addEventListener() {},
+    getElementsByTagName(tag) { return tag === 'canvas' ? [canvas] : []; },
+    querySelectorAll() { return []; }
+  };
+  const w = loadBridge(host, {
+    __gcDiag: true,
+    HTMLCanvasElement: Canvas,
+    document,
+    devicePixelRatio: 2.75,
+    innerWidth: 2400,
+    innerHeight: 1080
+  });
+  canvas.getContext('webgl');
+  w.__gcDiagDump(); // keep the context attached before facts are read
+  // The load listener is the natural point; invoke it through the dump instead.
+  const dump = JSON.parse(w.__gcDiagDump());
+  assert.strictEqual(dump.page.dpr, 2.75);
+  assert.strictEqual(dump.page.innerWidth, 2400);
+  assert.strictEqual(dump.page.innerHeight, 1080);
+  assert.strictEqual(dump.page.visibility, 'visible');
+  assert.strictEqual(dump.page.canvases.length, 1);
+  assert.strictEqual(dump.page.canvases[0].webgl, true);
+  assert.strictEqual(dump.page.gl.maxTexture, 8192);
+  assert.strictEqual(dump.page.gl.maxRenderbuffer, 4096);
+  assert.strictEqual(dump.page.gl.maxTextureUnits, 16);
 });
