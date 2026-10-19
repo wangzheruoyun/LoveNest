@@ -387,10 +387,35 @@
   // `CachedFiles` directory and reads its first (only) entry.
   var WALLPAPER_ENTRY = 'TranscodedWallpaper';
 
-  /** The host's wallpaper bytes as base64, or `null` when it cannot read one. */
+  // Memoised `getWallpaper()` result: the successful base64 and the host
+  // function it came from.
+  var wallpaperCacheFn = null;
+  var wallpaperCacheValue = null;
+
+  /**
+   * The host's wallpaper bytes as base64, or `null` when it cannot read one.
+   *
+   * The engine probes the virtual tree up to five times per performance
+   * (`existsSync` / `readdirSync` / `accessSync` / `readFileSync` / `statSync`),
+   * and on Android each probe redraws and PNG-compresses the wallpaper, so a
+   * *successful* read is memoised. The cache is keyed on the host function
+   * itself and a *failed* read is never cached, so a later probe — or a new
+   * host — is retried rather than pinned to a stale `null`.
+   */
   function wallpaperBase64() {
+    var getter = (host && typeof host.getWallpaper === 'function') ? host.getWallpaper : null;
+    if (getter === null) return null;
+    if (getter === wallpaperCacheFn) return wallpaperCacheValue;
     var b64 = hostCall('getWallpaper');
-    return (typeof b64 === 'string' && b64.length > 0) ? b64 : null;
+    var value = (typeof b64 === 'string' && b64.length > 0) ? b64 : null;
+    if (value !== null) {
+      wallpaperCacheFn = getter;
+      wallpaperCacheValue = value;
+    } else {
+      wallpaperCacheFn = null;
+      wallpaperCacheValue = null;
+    }
+    return value;
   }
 
   /** True when `abs` (already host-absolute) is inside the virtual tree. */

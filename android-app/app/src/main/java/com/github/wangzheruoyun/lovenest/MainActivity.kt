@@ -81,6 +81,7 @@ class MainActivity : Activity() {
     private lateinit var gateButton: Button
 
     private var webView: WebView? = null
+    private var gameBridge: GameBridge? = null
     private var gameStarted = false
     private var bridgeFailureReported = false
 
@@ -207,10 +208,9 @@ class MainActivity : Activity() {
 
             // The engine's Cordova-vibrate branch is unreachable on platform 2;
             // the shim routes what it can here instead.
-            addJavascriptInterface(
-                GameBridge(this@MainActivity, GAME_ROOT, docsRootPath()),
-                JS_INTERFACE_NAME,
-            )
+            val bridge = GameBridge(this@MainActivity, GAME_ROOT, docsRootPath())
+            gameBridge = bridge
+            addJavascriptInterface(bridge, JS_INTERFACE_NAME)
 
             webViewClient = GameWebViewClient()
         }
@@ -417,12 +417,28 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // Backgrounding can leave a `screenOff()` brightness override in place
+        // (a window attribute survives pause), so always drop it on the way back.
+        gameBridge?.restoreScreenBrightness()
         if (gameStarted) dispatchDocumentEvent("resume") else updateGate()
     }
 
     override fun onPause() {
+        // Same reason as onResume: never leave the window black behind us.
+        gameBridge?.restoreScreenBrightness()
         if (gameStarted) dispatchDocumentEvent("pause")
         super.onPause()
+    }
+
+    /**
+     * `offMonitor`'s `scrnsave.scr /s` blackout ends on the player's next
+     * interaction, exactly like a screensaver. Android reports every touch or
+     * key here regardless of what consumes it, so this is a reliable "the user
+     * did something" hook.
+     */
+    override fun onUserInteraction() {
+        super.onUserInteraction()
+        gameBridge?.restoreScreenBrightness()
     }
 
     private fun dispatchDocumentEvent(name: String) {

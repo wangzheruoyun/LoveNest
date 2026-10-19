@@ -20,6 +20,7 @@ import android.provider.Settings
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.JavascriptInterface
 import android.widget.Toast
 import androidx.core.content.FileProvider
@@ -28,6 +29,7 @@ import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONArray
 
 /**
@@ -76,6 +78,13 @@ class GameBridge(
     private val paths = RootedPathAuthority(game, docs)
 
     private val main = Handler(Looper.getMainLooper())
+
+    /**
+     * True between [screenOff] and the next [restoreScreenBrightness], so the
+     * activity's per-touch restore is a cheap no-op instead of a queued
+     * runnable on every frame the player touches.
+     */
+    private val screenDimmed = AtomicBoolean(false)
 
     init {
         // The shim resolves save paths from os.homedir() == docsRoot(), and the
@@ -287,13 +296,16 @@ class GameBridge(
 
         val answered = CountDownLatch(1)
         val yes = AtomicBoolean(false)
+        // Set on the main thread when the dialog is created, so the timeout
+        // branch can close the exact dialog this question put on screen.
+        val dialogRef = AtomicReference<AlertDialog?>(null)
         main.post {
             try {
                 if (activity.isFinishing || activity.isDestroyed) {
                     answered.countDown()
                     return@post
                 }
-                AlertDialog.Builder(activity)
+                val dialog = AlertDialog.Builder(activity)
                     .setTitle(title ?: "")
                     .setMessage(body ?: "")
                     .setPositiveButton(android.R.string.yes) { _, _ ->
@@ -302,17 +314,37 @@ class GameBridge(
                     }
                     .setNegativeButton(android.R.string.no) { _, _ -> answered.countDown() }
                     .setOnCancelListener { _ -> answered.countDown() }
-                    .show()
+                    .create()
+                dialogRef.set(dialog)
+                dialog.show()
             } catch (_: Exception) {
                 answered.countDown()
             }
         }
-        return try {
-            answered.await(CONFIRM_TIMEOUT_MS, TimeUnit.MILLISECONDS) && yes.get()
+
+        val gotAnswer = try {
+            answered.await(CONFIRM_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             false
         }
+
+        if (!gotAnswer) {
+            // Nobody answered in time. Dismiss on the main thread so the dialog
+            // cannot outlive the question and be clicked into a latch nobody is
+            // waiting on. Deferring the dismiss lets a click that was already
+            // queued run first; `dismiss()` is idempotent and `answered` is
+            // already released, so neither ordering double-counts or throws.
+            main.post {
+                try {
+                    dialogRef.get()?.dismiss()
+                } catch (_: Exception) {
+                    // Already gone.
+                }
+            }
+            return false
+        }
+        return yes.get()
     }
 
     /**
@@ -320,18 +352,49 @@ class GameBridge(
      * so the screen looks off during the performance.
      *
      * `screenBrightness = 0f` is a per-window override, so the device's own
-     * brightness setting is never touched; the override is dropped when the app
-     * leaves the foreground.
+     * brightness setting is never touched. Unlike the Windows screensaver, a
+     * window attribute is *not* cleared by backgrounding, so [screenOff] also
+     * arms a backstop and the activity calls [restoreScreenBrightness] on the
+     * next user interaction and on pause/resume. See those two paths.
      */
     @JavascriptInterface
     fun screenOff() {
+        screenDimmed.set(true)
         main.post {
+            // A restore (touch / pause) may have been queued before this ran and
+            // already cancelled the dimming; honour that rather than re-dim.
+            if (!screenDimmed.get()) return@post
             try {
                 val attributes = activity.window.attributes
                 attributes.screenBrightness = 0f
                 activity.window.attributes = attributes
             } catch (_: Exception) {
                 // A window that refuses the override is not worth failing the game for.
+            }
+        }
+        // Safety net: the original ends on the next input, but a player who
+        // never touches the screen must not be left staring at black forever.
+        main.postDelayed({ restoreScreenBrightness() }, SCREEN_OFF_BACKSTOP_MS)
+    }
+
+    /**
+     * Drops the [screenOff] brightness override so the normal brightness
+     * applies again. Idempotent and safe from any thread: the activity calls it
+     * on user interaction and on pause/resume, and [screenOff] schedules it as
+     * a backstop. A window that is already gone is ignored; a call when nothing
+     * was dimmed does no work at all.
+     */
+    fun restoreScreenBrightness() {
+        if (!screenDimmed.getAndSet(false)) return
+        main.post {
+            try {
+                val attributes = activity.window.attributes
+                if (attributes.screenBrightness != WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE) {
+                    attributes.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                    activity.window.attributes = attributes
+                }
+            } catch (_: Exception) {
+                // The window has gone; nothing to restore.
             }
         }
     }
@@ -482,6 +545,13 @@ class GameBridge(
 
         /** How long a `confirm()` answer may take before it becomes "no". */
         const val CONFIRM_TIMEOUT_MS = 5 * 60 * 1000L
+
+        /**
+         * How long [screenOff] may keep the window black if no touch arrives.
+         * The Windows screensaver ends on the next input; this is the safety
+         * net that ends it anyway.
+         */
+        const val SCREEN_OFF_BACKSTOP_MS = 60 * 1000L
 
         /**
          * Prefix of the Ruling D asset-probe failure line emitted by

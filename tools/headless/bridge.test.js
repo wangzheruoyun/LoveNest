@@ -968,3 +968,39 @@ test('offMonitor 的 scrnsave.scr /s 命令路由到 screenOff()（不是关机�
   assert.strictEqual(off, 2, 'execSync 形态必须熄屏');
   assert.strictEqual(shut, 0);
 });
+
+/* ------------------------------------------------------------------ *
+ * Task 7b fix round 1 — memoise the wallpaper read
+ *
+ * The engine probes the virtual Themes tree five times per performance
+ * (`existsSync` / `readdirSync` / `accessSync` / `readFileSync` / `statSync`),
+ * and on Android each probe redraws and PNG-compresses the wallpaper. A
+ * successful read is therefore cached; a failed one must stay retryable.
+ * (The Kotlin dialog/brightness fixes are device-only and cannot be pinned
+ * here.)
+ * ------------------------------------------------------------------ */
+
+test('壁纸成功读取后缓存，多次探测只读一次；失败不缓存、可重试', () => {
+  const real = fs.readFileSync(GAME_ROOT + '/icon.png').toString('base64');
+  let asked = 0;
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.getWallpaper = () => { asked++; return real; };
+  const w = loadBridge(host);
+  const fsShim = w.require('fs');
+  const path = w.require('path');
+  const cached = path.join(w.process.env.APPDATA, '\\Microsoft\\Windows\\Themes\\CachedFiles\\');
+  const file = path.join(cached, 'TranscodedWallpaper');
+
+  fsShim.existsSync(cached);
+  fsShim.readdirSync(cached);
+  fsShim.accessSync(file, fsShim.constants.R_OK | fsShim.constants.F_OK);
+  assert.strictEqual(fsShim.readFileSync(file, { encoding: null }).toString('base64'), real);
+  fsShim.statSync(file);
+  assert.strictEqual(asked, 1, '同一宿主上多次探测只应读取一次壁纸');
+
+  // A failed read must not be cached: replacing the host re-reads it.
+  host.getWallpaper = () => null;
+  assert.strictEqual(fsShim.existsSync(cached), false, '失败后不得沿用旧缓存');
+  assert.throws(() => fsShim.readFileSync(file, { encoding: null }),
+    (err) => err && err.code === 'ENOENT');
+});
