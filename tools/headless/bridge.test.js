@@ -2,6 +2,8 @@ const test = require('node:test');
 const assert = require('node:assert');
 const vm = require('node:vm');
 const fs = require('node:fs');
+const os = require('node:os');
+const nodePath = require('node:path');
 const { createHost } = require('./host-native');
 
 const GAME_ROOT = '/storage/emulated/0/Download/爱之巢DemoV1.52';
@@ -1752,4 +1754,128 @@ test('onPC 已为 true 时不重写（桌面运行保持惰性）', () => {
   ticks[0]();
   assert.strictEqual(browser.onPC, true);
   assert.strictEqual(browser.onMobile, false);
+});
+
+/* ------------------------------------------------------------------ *
+ * Task 14 — the engine's generated files stay out of the shipped folder.
+ *
+ * `FileUtils.nativePath` is `process.cwd()`, i.e. the game root, so every
+ * relative path the engine writes resolves *into* the 740 MB distribution:
+ * `savedata/life.gcdata`, `log/`, `晴小姐\日记.txt`, and the "fourth wall"
+ * notes it leaves for the player. A device run proved it — five empty
+ * directories appeared under the game folder, plus a rewritten
+ * 《爱之巢》游戏攻略.txt.
+ *
+ * The shim therefore mirrors every game-root *write* to the documents root and
+ * lets a *read* fall back to that mirror, game root first. A shipped asset
+ * therefore always wins a read, and the engine still finds what it wrote.
+ *
+ * The sandbox roots are deliberate and load-bearing: a test that wrote at the
+ * real `/storage/emulated/0/Download/爱之巢DemoV1.52` would itself modify the
+ * distribution — which is the very bug under test.
+ * ------------------------------------------------------------------ */
+
+function sandbox(tag) {
+  return {
+    gameRoot: fs.mkdtempSync(nodePath.join(os.tmpdir(), 'lovenest-' + tag + '-game-')),
+    docsRoot: fs.mkdtempSync(nodePath.join(os.tmpdir(), 'lovenest-' + tag + '-docs-')),
+  };
+}
+
+function cleanUp(roots) {
+  fs.rmSync(roots.gameRoot, { recursive: true, force: true });
+  fs.rmSync(roots.docsRoot, { recursive: true, force: true });
+}
+
+test('引擎写游戏根目录的路径会重挂到 docsRoot，游戏目录不新增任何条目', () => {
+  const roots = sandbox('mirror');
+  try {
+    const fsShim = loadBridge(createHost(roots)).require('fs');
+
+    fsShim.mkdirSync(roots.gameRoot + '/savedata', { recursive: true });
+    fsShim.mkdirSync(roots.gameRoot + '/log', { recursive: true });
+    fsShim.writeFileSync(roots.gameRoot + '/savedata/life.gcdata', '存档');
+
+    assert.deepStrictEqual(fs.readdirSync(roots.gameRoot), [],
+      '游戏根目录必须保持原样：不得新增 savedata/ 或 log/');
+    assert.strictEqual(
+      fs.readFileSync(nodePath.join(roots.docsRoot, 'savedata/life.gcdata'), 'utf8'), '存档');
+  } finally {
+    cleanUp(roots);
+  }
+});
+
+test('相对路径的写入同样重挂（引擎用 cwd() 拼出绝对路径）', () => {
+  const roots = sandbox('relative');
+  try {
+    const fsShim = loadBridge(createHost(roots)).require('fs');
+    fsShim.writeFileSync('savedata/rel.gcdata', '相对');
+    assert.deepStrictEqual(fs.readdirSync(roots.gameRoot), []);
+    assert.strictEqual(
+      fs.readFileSync(nodePath.join(roots.docsRoot, 'savedata/rel.gcdata'), 'utf8'), '相对');
+  } finally {
+    cleanUp(roots);
+  }
+});
+
+test('Windows 风格反斜杠路径同样重挂，名字原样保留', () => {
+  const roots = sandbox('backslash');
+  const flat = '\\AppData\\Roaming\\cicigames\\LoveNest';
+  try {
+    const fsShim = loadBridge(createHost(roots)).require('fs');
+    fsShim.mkdirSync(roots.gameRoot + '/' + flat, { recursive: true });
+    fsShim.writeFileSync(roots.gameRoot + '/' + flat + '\\被你发现啦.txt', '你找到我啦');
+
+    assert.deepStrictEqual(fs.readdirSync(roots.gameRoot), []);
+    // Android has no `\` separator, so the engine's path stays one flat name —
+    // exactly what the device produced, only under Documents now.
+    assert.strictEqual(
+      fs.readFileSync(nodePath.join(roots.docsRoot, flat + '\\被你发现啦.txt'), 'utf8'), '你找到我啦');
+  } finally {
+    cleanUp(roots);
+  }
+});
+
+test('引擎读回自己写的存档：游戏根优先，miss 时落到 docsRoot 镜像', () => {
+  const roots = sandbox('readback');
+  try {
+    const fsShim = loadBridge(createHost(roots)).require('fs');
+    fsShim.writeFileSync(roots.gameRoot + '/savedata/life.gcdata', '存档');
+
+    assert.strictEqual(fsShim.existsSync(roots.gameRoot + '/savedata/life.gcdata'), true);
+    assert.strictEqual(
+      fsShim.readFileSync(roots.gameRoot + '/savedata/life.gcdata', 'utf8'), '存档');
+    assert.deepStrictEqual(fsShim.readdirSync(roots.gameRoot + '/savedata'), ['life.gcdata']);
+    assert.strictEqual(fsShim.statSync(roots.gameRoot + '/savedata/life.gcdata').size, 6);
+  } finally {
+    cleanUp(roots);
+  }
+});
+
+test('游戏目录里真实存在的文件不会被镜像遮蔽（游戏根优先）', () => {
+  const roots = sandbox('shadow');
+  try {
+    const fsShim = loadBridge(createHost(roots)).require('fs');
+    fs.writeFileSync(nodePath.join(roots.gameRoot, 'onsale.txt'), '发行版');
+    fs.writeFileSync(nodePath.join(roots.docsRoot, 'onsale.txt'), '引擎写的');
+    assert.strictEqual(fsShim.readFileSync(roots.gameRoot + '/onsale.txt', 'utf8'), '发行版');
+  } finally {
+    cleanUp(roots);
+  }
+});
+
+test('unlink 不会删掉游戏目录里的文件，也不会宣称成功', () => {
+  const roots = sandbox('unlink');
+  try {
+    const fsShim = loadBridge(createHost(roots)).require('fs');
+    fs.writeFileSync(nodePath.join(roots.gameRoot, 'index.html'), '<html></html>');
+
+    assert.throws(
+      () => fsShim.unlinkSync(roots.gameRoot + '/index.html'),
+      (err) => err.code === 'EACCES');
+    assert.strictEqual(fs.existsSync(nodePath.join(roots.gameRoot, 'index.html')), true,
+      '发行版文件必须原样保留');
+  } finally {
+    cleanUp(roots);
+  }
 });

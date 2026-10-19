@@ -252,41 +252,59 @@
 
   /* ------------------------------------------------------------------ *
    * Write path: logged no-ops that report success.
+   *
+   * A write that resolves *inside the game root* is exactly the bug this
+   * harness must catch. The engine derives its save, log and "fourth wall"
+   * paths from `process.cwd()` (= the game root), so a shim that fails to
+   * re-root them writes into the 740 MB distribution. That used to be
+   * invisible here - writes were no-ops, so nothing ever looked at the
+   * target - and it took a real device run to notice. `LEAK` marks it in the
+   * log and fails the write, so a headless run says so out loud.
    * ------------------------------------------------------------------ */
 
   function emit(kind, msg) {
     console.log('[host:' + kind + '] ' + msg);
   }
 
-  function writeBase64(p, b64) {
+  /** Resolve a write target, refusing (loudly) anything inside the game root. */
+  function writeTarget(p) {
     var path = resolveWithin(p);
+    if (path !== null && gameRootPath && isInside(gameRootPath, path)) {
+      emit('LEAK', 'write inside the game root: ' + path);
+      return null;
+    }
+    return path;
+  }
+
+  function writeBase64(p, b64) {
+    var path = writeTarget(p);
     emit('write', 'no-op ' + (path === null ? String(p) : path) +
       ' (' + String(b64 == null ? '' : b64).length + ' b64 chars)');
     return path !== null;
   }
 
   function mkdirp(p) {
-    var path = resolveWithin(p);
+    var path = writeTarget(p);
     emit('mkdirp', 'no-op ' + (path === null ? String(p) : path));
     return path !== null;
   }
 
   function unlink(p) {
-    var path = resolveWithin(p);
+    var path = writeTarget(p);
     emit('unlink', 'no-op ' + (path === null ? String(p) : path));
     return path !== null;
   }
 
   function rename(p, to) {
-    var path = resolveWithin(p);
-    var target = resolveWithin(to);
+    var path = writeTarget(p);
+    var target = writeTarget(to);
     emit('rename', 'no-op ' + (path === null ? String(p) : path) +
       ' -> ' + (target === null ? String(to) : target));
     return path !== null && target !== null;
   }
 
   function rmdir(p) {
-    var path = resolveWithin(p);
+    var path = writeTarget(p);
     emit('rmdir', 'no-op ' + (path === null ? String(p) : path));
     return path !== null;
   }

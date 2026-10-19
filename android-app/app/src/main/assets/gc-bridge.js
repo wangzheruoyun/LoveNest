@@ -78,6 +78,81 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * The game root is read-only in effect (Task 14)
+   *
+   * The engine generates files of its own: saves, its own log, and the
+   * "fourth wall" notes it leaves for the player. It builds those paths from
+   * `FileUtils.nativePath`, which is `process.cwd()` - the game root - so left
+   * alone they land inside the shipped distribution, which this port promises
+   * to keep byte-for-byte as shipped (2047 files, no `savedata/`).
+   *
+   * The shim therefore keeps one two-directional rule for the game root:
+   *
+   *   write -> the same path, mirrored under the documents root
+   *   read  -> the game root first, and only on a miss the mirror
+   *
+   * A shipped asset therefore always wins a read, while a file the engine
+   * wrote is still found where the engine put it. The mirror is a pure prefix
+   * swap, so the engine's own naming survives exactly - including the
+   * Windows-style `\AppData\...` paths, which on Android become one flat name
+   * and keep working because both directions use the same swap.
+   *
+   * `null` means "not a game-root path - leave it alone". The device host
+   * (`RootedPathAuthority`) resolves by string containment only, never by
+   * existence, so it cannot do the read half itself; the knowledge that a path
+   * came from the engine's relative resolution rather than from a shipped
+   * asset exists only here.
+   * ------------------------------------------------------------------ */
+
+  function mirrorOf(abs) {
+    var games = gameRoot();
+    var docs = docsRoot();
+    if (!games || games === '/' || !docs || docs === '/') return null;
+    if (abs === games) return docs;
+    if (abs.indexOf(games + '/') !== 0) return null;
+    return docs + abs.slice(games.length);
+  }
+
+  /**
+   * The `__GCNative` methods that mutate the filesystem, and how many of their
+   * leading arguments are paths. The count is explicit because
+   * `writeBase64(path, base64)` must never have its payload "redirected".
+   */
+  var HOST_WRITE_OPS = { writeBase64: 1, mkdirp: 1, unlink: 1, rmdir: 1, rename: 2 };
+
+  /** A write target: the documents mirror when the path is inside the game root. */
+  function writeTowardMirror(abs) {
+    var mirror = mirrorOf(abs);
+    return mirror === null ? abs : mirror;
+  }
+
+  /**
+   * The "nothing here" answer of each read primitive, so the mirror is probed
+   * only after a miss and a *hit* costs exactly the one round trip it always
+   * did - the shipped 740 MB distribution is read on every launch, and this
+   * must not double that traffic.
+   */
+  function missUnlessTrue(v) { return v !== true; }
+
+  function missUnlessText(v) { return typeof v !== 'string'; }
+
+  function missStat(v) { return parseStat(v) === null; }
+
+  /**
+   * Ask the host for [abs], and only when it has nothing there, ask again for
+   * the same path under the documents root. A miss that the mirror also misses
+   * returns the original answer, so every error code stays exactly as it was.
+   */
+  function hostRead(name, abs, isMiss) {
+    var first = hostCall(name, abs);
+    if (!isMiss(first)) return first;
+    var mirror = mirrorOf(abs);
+    if (mirror === null) return first;
+    var second = hostCall(name, mirror);
+    return isMiss(second) ? first : second;
+  }
+
+  /* ------------------------------------------------------------------ *
    * POSIX `path` shim
    *
    * A faithful port of Node's `path.posix` primitives (normalize, join,
@@ -1933,6 +2008,15 @@
    * path.
    */
   function hostCall(name, arg1, arg2) {
+    // Every engine write is re-rooted away from the shipped game folder before
+    // it reaches the host (see `mirrorOf`). Done first so the diagnostic line
+    // below reports the path the host actually receives.
+    var writeOp = HOST_WRITE_OPS[name];
+    if (writeOp) {
+      if (writeOp >= 1 && typeof arg1 === 'string') arg1 = writeTowardMirror(arg1);
+      if (writeOp >= 2 && typeof arg2 === 'string') arg2 = writeTowardMirror(arg2);
+    }
+
     var diag = diagEnabled();
     if (diag) {
       var args = 0;
@@ -2160,7 +2244,7 @@
       try {
         var abs = resolvePath(p);
         if (isWallpaperPath(abs)) return wallpaperBase64() !== null;
-        return hostCall('exists', abs) === true;
+        return hostRead('exists', abs, missUnlessTrue) === true;
       } catch (e) {
         return false;
       }
@@ -2175,7 +2259,7 @@
         var wenc = canonicalEncoding(parseEncoding(options));
         return (wenc === null) ? wbytes : decodeWith(wenc, wbytes);
       }
-      var b64 = hostCall('readBase64', abs);
+      var b64 = hostRead('readBase64', abs, missUnlessText);
       if (typeof b64 !== 'string') throw lookupFailure(abs, 'open', 'EISDIR');
       var bytes = toBuffer(b64);
       var enc = canonicalEncoding(parseEncoding(options));
@@ -2202,6 +2286,18 @@
         return [WALLPAPER_ENTRY];
       }
       var info = parseStat(hostCall('stat', abs));
+      if (!info) {
+        // Nothing in the game root: the directory may be one the engine created
+        // and the shim mirrored to the documents root.
+        var mirror = mirrorOf(abs);
+        if (mirror !== null) {
+          var mirroredInfo = parseStat(hostCall('stat', mirror));
+          if (mirroredInfo) {
+            info = mirroredInfo;
+            abs = mirror;
+          }
+        }
+      }
       if (!info) throw lookupFailure(abs, 'scandir', 'ENOENT');
       if (!info.isDirectory) throw fsError('ENOTDIR', 'scandir', abs);
       var text = hostCall('readDir', abs);
@@ -2225,7 +2321,7 @@
         if (wallpaperBase64() === null) throw fsError('ENOENT', 'stat', abs);
         return makeStats({ isDirectory: isWallpaperDir(abs), size: 0 });
       }
-      var info = parseStat(hostCall('stat', abs));
+      var info = parseStat(hostRead('stat', abs, missStat));
       if (!info) {
         if (!isWithinRoots(abs)) throw fsError('EACCES', 'stat', abs);
         throw fsError('ENOENT', 'stat', abs);
@@ -2244,7 +2340,7 @@
       // Non-recursive `mkdir` must fail like Node when the target already
       // exists or the parent is missing; the host only offers a recursive
       // primitive, so those two cases are checked here first.
-      if (hostCall('exists', abs) === true) throw fsError('EEXIST', 'mkdir', abs);
+      if (hostRead('exists', abs, missUnlessTrue) === true) throw fsError('EEXIST', 'mkdir', abs);
       var parent = dirname(abs);
       var parentInfo = parseStat(hostCall('stat', parent));
       if (!parentInfo) throw fsError('ENOENT', 'mkdir', abs);
@@ -2276,7 +2372,7 @@
         return undefined;
       }
       if (!isWithinRoots(abs)) throw fsError('EACCES', 'access', abs);
-      if (hostCall('exists', abs) !== true) throw fsError('ENOENT', 'access', abs);
+      if (hostRead('exists', abs, missUnlessTrue) !== true) throw fsError('ENOENT', 'access', abs);
       return undefined;
     },
 
