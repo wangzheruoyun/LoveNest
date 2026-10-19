@@ -25,8 +25,8 @@ android {
         applicationId = "com.github.wangzheruoyun.lovenest"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.0.0-diag3"
+        versionCode = 3
+        versionName = "1.0.0-fix1"
     }
 
     signingConfigs {
