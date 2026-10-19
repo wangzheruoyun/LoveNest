@@ -1,12 +1,15 @@
 package com.github.wangzheruoyun.lovenest
 
+import android.app.AlertDialog
 import android.app.Activity
 import android.app.WallpaperManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
 import android.os.Build
 import android.os.Handler
@@ -20,14 +23,18 @@ import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.widget.Toast
 import androidx.core.content.FileProvider
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
 
 /**
  * The native host behind `window.AndroidBridge`, which `MainActivity` aliases to
  * `window.__GCNative`.
  *
- * It implements the `__GCNative` contract name-for-name: the same 21 methods the
+ * It implements the `__GCNative` contract name-for-name: the same 24 methods the
  * headless host in `tools/headless/host-native.js` exposes, so `gc-bridge.js`
  * runs unchanged in Node and on the phone. The shim calls these *synchronously*
  * from its `fs` / `os` / `child_process` / `nw.gui` shims, so every member here
@@ -233,6 +240,102 @@ class GameBridge(
         }
     }
 
+    /**
+     * Stand-in for the wallpaper *read* half of `W26_DesktopWallpaper`: it walks
+     * `%APPDATA%\Microsoft\Windows\Themes` looking for the player's real
+     * wallpaper, which has no Android equivalent path. There is no wallpaper to
+     * read inside the app sandbox, so the phone's own wallpaper is handed back
+     * instead — the same image the player sees on their home screen.
+     *
+     * `getBitmap()` would be simpler but only exists on API 27+ (`minSdk 26`), so
+     * the wallpaper drawable is drawn into a fresh ARGB bitmap and re-encoded as
+     * PNG, which is what the engine's `data:image/png;base64,…` expects.
+     */
+    @JavascriptInterface
+    fun getWallpaper(): String? {
+        return try {
+            val drawable = WallpaperManager.getInstance(activity).drawable ?: return null
+            val width = drawable.intrinsicWidth
+            val height = drawable.intrinsicHeight
+            if (width <= 0 || height <= 0) return null
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            drawable.setBounds(0, 0, width, height)
+            drawable.draw(Canvas(bitmap))
+            val out = ByteArrayOutputStream()
+            if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) return null
+            Base64Stream.encode(out.toByteArray())
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Stand-in for `nircmd qboxcom "<content>" "<title>" consolewrite yes`: a real
+     * yes/no dialog whose answer becomes the engine's `stdout`.
+     *
+     * The engine calls this *synchronously* from its command router on the
+     * WebView's JavaBridge thread and branches on the returned boolean, so the
+     * dialog is shown on the main thread while this (background) thread waits on
+     * the answer. The wait is bounded, and an activity that is already gone
+     * answers "no" immediately, so a question the user never answers can never
+     * hang the game. A main-thread call returns `false` rather than deadlocking.
+     */
+    @JavascriptInterface
+    fun confirm(title: String?, body: String?): Boolean {
+        if (Looper.myLooper() == Looper.getMainLooper()) return false
+        if (activity.isFinishing || activity.isDestroyed) return false
+
+        val answered = CountDownLatch(1)
+        val yes = AtomicBoolean(false)
+        main.post {
+            try {
+                if (activity.isFinishing || activity.isDestroyed) {
+                    answered.countDown()
+                    return@post
+                }
+                AlertDialog.Builder(activity)
+                    .setTitle(title ?: "")
+                    .setMessage(body ?: "")
+                    .setPositiveButton(android.R.string.yes) { _, _ ->
+                        yes.set(true)
+                        answered.countDown()
+                    }
+                    .setNegativeButton(android.R.string.no) { _, _ -> answered.countDown() }
+                    .setOnCancelListener { _ -> answered.countDown() }
+                    .show()
+            } catch (_: Exception) {
+                answered.countDown()
+            }
+        }
+        return try {
+            answered.await(CONFIRM_TIMEOUT_MS, TimeUnit.MILLISECONDS) && yes.get()
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+    }
+
+    /**
+     * Stand-in for `offMonitor`'s `scrnsave.scr /s`: dim *this window* to black
+     * so the screen looks off during the performance.
+     *
+     * `screenBrightness = 0f` is a per-window override, so the device's own
+     * brightness setting is never touched; the override is dropped when the app
+     * leaves the foreground.
+     */
+    @JavascriptInterface
+    fun screenOff() {
+        main.post {
+            try {
+                val attributes = activity.window.attributes
+                attributes.screenBrightness = 0f
+                activity.window.attributes = attributes
+            } catch (_: Exception) {
+                // A window that refuses the override is not worth failing the game for.
+            }
+        }
+    }
+
     /** Stand-in for `nircmd trayballoon`. */
     @JavascriptInterface
     fun toast(msg: String?) {
@@ -344,7 +447,11 @@ class GameBridge(
 
     @JavascriptInterface
     fun log(s: String?) {
-        Log.d(TAG, s ?: "")
+        val text = s ?: ""
+        // Ruling D: a failed asset probe means the page cannot reach its own
+        // game files, which is the one failure that must not hide. Everything
+        // else the engine logs is informational.
+        if (text.startsWith(PROBE_FAILURE_PREFIX)) Log.e(TAG, text) else Log.d(TAG, text)
     }
 
     /* ------------------------------------------------------------------ *
@@ -372,6 +479,15 @@ class GameBridge(
         const val CLIP_LABEL = "Love Nest"
         const val SHUTDOWN_BLACKOUT_MS = 1200L
         const val MAX_VIBRATION_MS = 10_000L
+
+        /** How long a `confirm()` answer may take before it becomes "no". */
+        const val CONFIRM_TIMEOUT_MS = 5 * 60 * 1000L
+
+        /**
+         * Prefix of the Ruling D asset-probe failure line emitted by
+         * `MainActivity.BRIDGE_PROBE_JS`; see [log].
+         */
+        const val PROBE_FAILURE_PREFIX = "probe asset FAILED to load:"
 
         /** Matches `android:authorities="${applicationId}.fileprovider"` in the manifest. */
         const val FILE_PROVIDER_SUFFIX = ".fileprovider"

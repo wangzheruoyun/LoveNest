@@ -878,3 +878,93 @@ test('Buffer.from(Uint8Array) 复制而非共享底层字节', () => {
   assert.strictEqual(B.from('héllo', 'utf8').length, 6);
   assert.strictEqual(B.alloc(4).length, 4);
 });
+
+/* ------------------------------------------------------------------ *
+ * Task 7b — the three remaining Meta-performance gaps
+ *
+ * The engine reaches the phone's real wallpaper through a virtual
+ * `%APPDATA%\Microsoft\Windows\Themes` tree (`fs` only, no child_process),
+ * asks a yes/no question through `nircmd qboxcom` (`stdout.trim() == "yes"`),
+ * and darkens the screen through `scrnsave.scr /s`. Task 4 measured all three
+ * as non-landing; these tests pin the routing that closes them.
+ * ------------------------------------------------------------------ */
+
+test('APPDATA\\Microsoft\\Windows\\Themes 壁纸读取经 getWallpaper() 返回真实字节', () => {
+  const real = fs.readFileSync(GAME_ROOT + '/icon.png').toString('base64');
+  let asked = 0;
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.getWallpaper = () => { asked++; return real; };
+  const w = loadBridge(host);
+  const fsShim = w.require('fs');
+  const path = w.require('path');
+
+  // Exactly the paths W26_DesktopWallpaper builds from process.env.APPDATA.
+  const cached = path.join(w.process.env.APPDATA, '\\Microsoft\\Windows\\Themes\\CachedFiles\\');
+  assert.strictEqual(fsShim.existsSync(cached), true, '有壁纸时 CachedFiles 必须如实存在');
+  const names = fsShim.readdirSync(cached);
+  assert.ok(Array.isArray(names) && names.length > 0, 'CachedFiles 必须列出至少一个文件');
+
+  const file = path.join(cached, names[0]);
+  assert.doesNotThrow(() => fsShim.accessSync(file, fsShim.constants.R_OK | fsShim.constants.F_OK));
+  const bytes = fsShim.readFileSync(file, { encoding: null });
+  assert.strictEqual(bytes.toString('base64'), real, '读回的必须是壁纸的真实字节');
+
+  // The engine's own last step: "data:image/png;base64," + data.toString('base64').
+  assert.strictEqual(
+    'data:image/png;base64,' + bytes.toString('base64'),
+    'data:image/png;base64,' + real);
+  assert.ok(asked > 0, 'getWallpaper() 必须被调用');
+
+  // No wallpaper -> the tree reports "absent", the way a fresh Windows profile
+  // does, and the engine degrades to an empty string rather than a corrupt URL.
+  host.getWallpaper = () => null;
+  assert.strictEqual(fsShim.existsSync(cached), false);
+  assert.throws(() => fsShim.readFileSync(file, { encoding: null }),
+    (err) => err && err.code === 'ENOENT');
+});
+
+test('nircmd qboxcom 路由到 confirm()，并据其返回值在 stdout 恰好产出 "yes" / ""', async () => {
+  const asks = [];
+  let answer = true;
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.toast = () => {}; // the notification is not what this test pins
+  host.confirm = (title, body) => { asks.push([String(title), String(body)]); return answer; };
+  const w = loadBridge(host);
+  const cp = w.require('child_process');
+  const exe = '"' + GAME_ROOT + '/asset/pcSys/nircmd.exe"';
+  const cmd = exe + ' "qboxcom" "要退出吗" "确认" consolewrite yes';
+
+  // The engine calls exec (not execSync) and compares stdout.trim() == "yes".
+  const yes = await new Promise((resolve) => {
+    cp.exec(cmd, (err, stdout) => resolve(String(stdout)));
+  });
+  assert.strictEqual(yes.trim(), 'yes', '用户答“是”时 stdout.trim() 必须是 "yes"');
+  assert.deepStrictEqual(asks, [['确认', '要退出吗']], 'confirm(title, body) 的参数顺序');
+
+  asks.length = 0;
+  answer = false;
+  const no = await new Promise((resolve) => {
+    cp.exec(cmd, (err, stdout) => resolve(String(stdout)));
+  });
+  assert.strictEqual(no, '', '用户答“否”时 stdout 必须是空串（不得是 "no"）');
+  assert.deepStrictEqual(asks, [['确认', '要退出吗']]);
+});
+
+test('offMonitor 的 scrnsave.scr /s 命令路由到 screenOff()（不是关机、不是只写日志）', () => {
+  let off = 0;
+  let shut = 0;
+  const host = createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' });
+  host.log = () => {};
+  host.fakeShutdown = () => { shut++; };
+  host.screenOff = () => { off++; };
+  const w = loadBridge(host);
+  const cp = w.require('child_process');
+
+  cp.exec('"undefined\\system32\\scrnsave.scr" /s', () => {});
+  assert.strictEqual(off, 1, 'exec 形态必须熄屏');
+  assert.strictEqual(shut, 0, '关显示器不得被当成关机');
+
+  assert.strictEqual(cp.execSync('"undefined\\system32\\scrnsave.scr" /s'), '');
+  assert.strictEqual(off, 2, 'execSync 形态必须熄屏');
+  assert.strictEqual(shut, 0);
+});

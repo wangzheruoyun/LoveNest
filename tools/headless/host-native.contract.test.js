@@ -4,7 +4,7 @@
  * Contract tests for the rest of the `createHost()` surface.
  *
  * `host-native.test.js` is the minimal contract fixed by the plan and covers
- * three methods. The host implements nineteen, and every later JS task builds
+ * three methods. The host implements the rest, and every later JS task builds
  * on them, so the remaining behaviour — path resolution / escape rejection,
  * base64 round trips, the failure-never-throws rule, and the "game folder is
  * never written to" constraint — is pinned down here.
@@ -20,7 +20,8 @@ const GAME_ROOT = '/storage/emulated/0/Download/爱之巢DemoV1.52';
 const DOCS_ROOT = '/tmp/lovenest-contract-' + process.pid;
 
 // The full `__GCNative` method list from the plan's Task 3 Interfaces, extended
-// by Task 5 fix round 2 with `rename`/`rmdir` (21 methods).
+// by Task 5 fix round 2 with `rename`/`rmdir` (21 methods) and by Task 7b with
+// `getWallpaper`/`confirm`/`screenOff` (24 methods).
 const METHOD_NAMES = [
   'gameRoot',
   'docsRoot',
@@ -36,6 +37,9 @@ const METHOD_NAMES = [
   'deviceName',
   'androidVersion',
   'setWallpaper',
+  'getWallpaper',
+  'confirm',
+  'screenOff',
   'toast',
   'fakeShutdown',
   'openFile',
@@ -91,7 +95,7 @@ const ESCAPING_PATHS = [
   '../escape.txt',
 ];
 
-test('实现 Task 3 Interfaces 的全部 21 个方法，不多不少', () => {
+test('实现 Task 3 Interfaces 的全部 24 个方法，不多不少', () => {
   assert.deepStrictEqual(Object.keys(host).sort(), [...METHOD_NAMES].sort());
   for (const name of METHOD_NAMES) {
     assert.strictEqual(typeof host[name], 'function', name + ' 必须是函数');

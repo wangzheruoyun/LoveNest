@@ -38,6 +38,13 @@ function createHost(options) {
   const root = normalizeRoot(opts.gameRoot);
   const docs = normalizeRoot(opts.docsRoot);
 
+  // The player's wallpaper, as a real file. It is deliberately *not* resolved
+  // through `toRealPath`: on a device the wallpaper lives outside both roots
+  // (system storage), and here it stands in for `WallpaperManager`.
+  const wallpaperPath = (opts.wallpaperPath == null || opts.wallpaperPath === '')
+    ? null
+    : String(opts.wallpaperPath);
+
   /**
    * Resolve a caller-supplied path to a real path, or `null` when it escapes
    * both roots. A path starting with `/` is absolute; anything else is
@@ -172,6 +179,34 @@ function createHost(options) {
     setWallpaper: function (b64) {
       // No desktop to decorate in a headless run.
       return false;
+    },
+
+    /**
+     * The phone's current wallpaper as base64, or `null` when none is set.
+     * On Android this is `WallpaperManager.getDrawable()` re-encoded to PNG;
+     * here it is `opts.wallpaperPath` read straight off disk.
+     */
+    getWallpaper: function () {
+      if (wallpaperPath === null) return null;
+      try {
+        return fs.readFileSync(wallpaperPath).toString('base64');
+      } catch (e) {
+        return null;
+      }
+    },
+
+    /**
+     * Ask the player a yes/no question. A headless run has nobody to ask, so
+     * it always declines — and never blocks.
+     */
+    confirm: function (title, body) {
+      emit('confirm', String(title == null ? '' : title) + ' | ' +
+        String(body == null ? '' : body));
+      return false;
+    },
+
+    screenOff: function () {
+      emit('screenOff', 'dimming the window');
     },
 
     toast: function (msg) {

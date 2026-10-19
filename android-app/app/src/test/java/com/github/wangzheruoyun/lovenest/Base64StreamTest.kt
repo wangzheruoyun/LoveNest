@@ -45,6 +45,13 @@ class Base64StreamTest {
     }
 
     @Test
+    fun encode_bytes_matches_the_one_shot_encoder() {
+        val bytes = ByteArray(1000) { (it * 7).toByte() }
+        assertEquals(Base64.getEncoder().encodeToString(bytes), Base64Stream.encode(bytes))
+        assertEquals("", Base64Stream.encode(ByteArray(0)))
+    }
+
+    @Test
     fun encode_returns_null_for_a_missing_file() {
         assertNull(Base64Stream.encode(File(tmp, "nope.bin")))
     }

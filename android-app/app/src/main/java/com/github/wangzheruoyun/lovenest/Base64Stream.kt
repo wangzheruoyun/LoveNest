@@ -5,8 +5,8 @@ import java.io.FileInputStream
 import java.util.Base64
 
 /**
- * Base64 codec for the two binary members of the `__GCNative` contract
- * (`readBase64` / `writeBase64`).
+ * Base64 codec for the binary members of the `__GCNative` contract
+ * (`readBase64` / `writeBase64`, and `getWallpaper` via [encode]`(ByteArray)`).
  *
  * `Base64.getEncoder().encodeToString(file.readBytes())` would be one line, but
  * it holds the whole file *and* the whole encoded string in memory at once. The
@@ -85,6 +85,9 @@ object Base64Stream {
             }
         }
     }
+
+    /** Base64 of [bytes] (no line breaks), matching Node's `toString('base64')`. */
+    fun encode(bytes: ByteArray): String = Base64.getEncoder().encodeToString(bytes)
 
     /** Decode base64 [text], tolerating the whitespace Node-style output never has. */
     fun decode(text: String): ByteArray? = try {

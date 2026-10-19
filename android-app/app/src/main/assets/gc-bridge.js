@@ -366,6 +366,44 @@
   };
 
   /* ------------------------------------------------------------------ *
+   * Real desktop wallpaper (`W26_DesktopWallpaper`) — a virtual APPDATA tree
+   *
+   * The engine's "read the player's real wallpaper" performance does not use
+   * `child_process`/`nw.gui`: it walks
+   * `path.join(process.env.APPDATA, "\\Microsoft\\Windows\\Themes\\")` with
+   * `fs.existsSync` / `readdirSync` / `accessSync` / `readFileSync`. Android has
+   * no such path, so `process.env.APPDATA` points at this synthetic root and
+   * those four probes are answered from the host's real wallpaper
+   * (`host.getWallpaper()`). When a wallpaper is available the tree looks
+   * exactly like a Windows profile whose `CachedFiles` directory is populated,
+   * so the engine takes the same branch it takes there; when the host reports
+   * none, the whole tree reports "absent" and the engine degrades to an empty
+   * string, just as it would on a fresh Windows install.
+   * ------------------------------------------------------------------ */
+
+  var WALLPAPER_ROOT = '/__wallpaper__';
+
+  // One synthetic filename, so `getDesktopWallpaperFiles()` finds a non-empty
+  // `CachedFiles` directory and reads its first (only) entry.
+  var WALLPAPER_ENTRY = 'TranscodedWallpaper';
+
+  /** The host's wallpaper bytes as base64, or `null` when it cannot read one. */
+  function wallpaperBase64() {
+    var b64 = hostCall('getWallpaper');
+    return (typeof b64 === 'string' && b64.length > 0) ? b64 : null;
+  }
+
+  /** True when `abs` (already host-absolute) is inside the virtual tree. */
+  function isWallpaperPath(abs) {
+    return abs === WALLPAPER_ROOT || abs.indexOf(WALLPAPER_ROOT + '/') === 0;
+  }
+
+  /** True for the virtual directories (`Themes/`, `CachedFiles/`), not the file. */
+  function isWallpaperDir(abs) {
+    return abs.indexOf(WALLPAPER_ENTRY) === -1;
+  }
+
+  /* ------------------------------------------------------------------ *
    * `process` shim
    * ------------------------------------------------------------------ */
 
@@ -376,7 +414,11 @@
     platform: 'win32',
     versions: { node: '0.64.1' },
     argv: [],
-    env: {},
+    // `APPDATA` is the one environment variable the engine reads (for the
+    // wallpaper path above); leaving it empty would make `path.join` drop it
+    // and land the walk inside the game root. Keep it a non-empty absolute
+    // value so the engine stays on its Windows code path.
+    env: { APPDATA: WALLPAPER_ROOT },
     cwd: function () {
       return gameRoot();
     },
@@ -418,6 +460,39 @@
   var B64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
   /**
+   * Node's `Buffer#toString(encoding)`, implemented for the plain byte arrays
+   * `fs.readFileSync(…, {encoding: null})` hands back.
+   *
+   * The engine turns the wallpaper bytes into a data URL with
+   * `data.toString('base64')`. A bare `Uint8Array` has a `toString` that joins
+   * the *decimal* byte values with commas (`"137,80,78,…"`), which would render
+   * as a broken image. Attaching Node's own encoding argument here keeps that
+   * last step working without a real `Buffer` polyfill.
+   */
+  function bufferToString(enc) {
+    var e = (enc === undefined || enc === null) ? 'utf8' : String(enc).toLowerCase();
+    if (e === 'base64') return toBase64(this);
+    if (e === 'latin1' || e === 'binary') return latin1Decode(this);
+    if (e === 'ascii') return asciiDecode(this);
+    return utf8Decode(this);
+  }
+
+  /** Give a byte array Node's `toString(encoding)`, non-enumerably. */
+  function attachBufferMethods(bytes) {
+    try {
+      Object.defineProperty(bytes, 'toString', {
+        value: bufferToString,
+        enumerable: false,
+        writable: true,
+        configurable: true
+      });
+    } catch (e) {
+      // A frozen / exotic array is still readable; only `toString` is lost.
+    }
+    return bytes;
+  }
+
+  /**
    * Decode a base64 string to a `Uint8Array`. Tolerates data: URLs, URL-safe
    * alphabet and whitespace; never throws.
    */
@@ -445,10 +520,14 @@
         bytes[out++] = (acc >> bits) & 0xff;
       }
     }
-    if (out === bytes.length) return bytes;
-    var trimmed = new Uint8Array(out);
-    for (var j = 0; j < out; j++) trimmed[j] = bytes[j];
-    return trimmed;
+    var result;
+    if (out === bytes.length) {
+      result = bytes;
+    } else {
+      result = new Uint8Array(out);
+      for (var j = 0; j < out; j++) result[j] = bytes[j];
+    }
+    return attachBufferMethods(result);
   }
 
   /* ------------------------------------------------------------------ *
@@ -889,7 +968,9 @@
 
     existsSync: function (p) {
       try {
-        return hostCall('exists', resolvePath(p)) === true;
+        var abs = resolvePath(p);
+        if (isWallpaperPath(abs)) return wallpaperBase64() !== null;
+        return hostCall('exists', abs) === true;
       } catch (e) {
         return false;
       }
@@ -897,6 +978,13 @@
 
     readFileSync: function (p, options) {
       var abs = resolvePath(p);
+      if (isWallpaperPath(abs)) {
+        var wallpaper = wallpaperBase64();
+        if (wallpaper === null) throw fsError('ENOENT', 'open', abs);
+        var wbytes = toBuffer(wallpaper);
+        var wenc = canonicalEncoding(parseEncoding(options));
+        return (wenc === null) ? wbytes : decodeWith(wenc, wbytes);
+      }
       var b64 = hostCall('readBase64', abs);
       if (typeof b64 !== 'string') throw lookupFailure(abs, 'open', 'EISDIR');
       var bytes = toBuffer(b64);
@@ -918,6 +1006,11 @@
 
     readdirSync: function (p) {
       var abs = resolvePath(p);
+      if (isWallpaperPath(abs)) {
+        if (wallpaperBase64() === null) throw fsError('ENOENT', 'scandir', abs);
+        if (!isWallpaperDir(abs)) throw fsError('ENOTDIR', 'scandir', abs);
+        return [WALLPAPER_ENTRY];
+      }
       var info = parseStat(hostCall('stat', abs));
       if (!info) throw lookupFailure(abs, 'scandir', 'ENOENT');
       if (!info.isDirectory) throw fsError('ENOTDIR', 'scandir', abs);
@@ -938,6 +1031,10 @@
 
     statSync: function (p) {
       var abs = resolvePath(p);
+      if (isWallpaperPath(abs)) {
+        if (wallpaperBase64() === null) throw fsError('ENOENT', 'stat', abs);
+        return makeStats({ isDirectory: isWallpaperDir(abs), size: 0 });
+      }
       var info = parseStat(hostCall('stat', abs));
       if (!info) {
         if (!isWithinRoots(abs)) throw fsError('EACCES', 'stat', abs);
@@ -984,6 +1081,10 @@
      */
     accessSync: function (p, mode) {
       var abs = resolvePath(p);
+      if (isWallpaperPath(abs)) {
+        if (wallpaperBase64() === null) throw fsError('ENOENT', 'access', abs);
+        return undefined;
+      }
       if (!isWithinRoots(abs)) throw fsError('EACCES', 'access', abs);
       if (hostCall('exists', abs) !== true) throw fsError('ENOENT', 'access', abs);
       return undefined;
@@ -1279,6 +1380,19 @@
   }
 
   /**
+   * True for the nircmd *question* box (`qboxcom`) that writes the player's
+   * answer to stdout. `infobox` and `trayballoon` are announcements with no
+   * answer, so they must not block on a dialog.
+   */
+  function isQuestionCommand(lower, tokens) {
+    if (lower.indexOf('nircmd') === -1) return false;
+    for (var i = 0; i < tokens.length; i++) {
+      if (tokens[i].toLowerCase() === 'qboxcom') return true;
+    }
+    return false;
+  }
+
+  /**
    * True when a whole token is an OS power verb.
    *
    * Matching a *token* (not the raw command) is deliberate: the engine sends
@@ -1359,7 +1473,18 @@
     // Checked *before* the power verbs on purpose: a box whose body happens to
     // contain "shutdown" is still a box, and only the popup text is quoted.
     if (isPopupCommand(lower, tokens)) {
-      hostCall('toast', popupTextFromArgs(quotedArgs(text)));
+      var popupArgs = quotedArgs(text);
+      hostCall('toast', popupTextFromArgs(popupArgs));
+      if (isQuestionCommand(lower, tokens)) {
+        // `qboxcom … consolewrite yes`: the engine's `showMessage_yes` reads the
+        // answer back from stdout and proceeds only on `"yes"`. Anything but an
+        // explicit yes — including "no" — must be the empty string, so the
+        // engine treats it as a decline.
+        var rest = Array.prototype.slice.call(popupArgs, 1); // drop the exe
+        var body = rest.length > 1 ? rest[1] : ''; // [kind, content, title]
+        var title = rest.length > 2 ? rest[2] : '';
+        return hostCall('confirm', String(title), String(body)) === true ? 'yes' : '';
+      }
       return '';
     }
 
@@ -1373,9 +1498,18 @@
       return '';
     }
 
+    // "switch the monitor off" — `W26_VisualSysOpt.offMonitor` runs
+    // `"<SystemRoot>\system32\scrnsave.scr" /s`. Android has no screensaver, so
+    // the host dims the window instead; the trace-console log line stays so the
+    // performance still leaves a trace (it is genuinely a no-op otherwise).
+    if (lower.indexOf('scrnsave') !== -1) {
+      hostCall('screenOff');
+      hostCall('log', text);
+      return '';
+    }
+
     // Everything else is Windows-only plumbing: the wmic system-info queries
-    // behind the trace console, nvidia-smi, rundll32, and scrnsave (the
-    // "switch the monitor off" performance, which has no host capability yet).
+    // behind the trace console, nvidia-smi, and rundll32.
     hostCall('log', text);
     return '';
   }

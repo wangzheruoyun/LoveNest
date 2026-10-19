@@ -569,6 +569,8 @@ class MainActivity : Activity() {
               try { path = String(location.pathname); } catch (e) {}
 
               function bridge() { try { return window.AndroidBridge; } catch (e) { return null; } }
+              // `GameBridge.log` escalates the "FAILED to load" line below to
+              // Log.e, so the one fatal case is visible as an error in logcat.
               function say(msg) { try { var b = bridge(); if (b && b.log) b.log(msg); } catch (e) {} }
 
               say('probe location.href=' + href + ' location.pathname=' + path);

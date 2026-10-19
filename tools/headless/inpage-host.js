@@ -21,8 +21,10 @@
  *     logged no-ops that report success (`true`). The game folder must stay
  *     byte-identical (NOTES.md "Housekeeping"), and a headless run has no real
  *     save location to write to. That limitation is recorded in NOTES.md.
- *   - Android-only capabilities (`setWallpaper` / `toast` / `fakeShutdown` /
- *     `openFile` / `vibrate` / clipboard) become console log lines.
+ *   - Android-only capabilities (`setWallpaper` / `getWallpaper` / `confirm` /
+ *     `screenOff` / `toast` / `fakeShutdown` / `openFile` / `vibrate` /
+ *     clipboard) become console log lines; `getWallpaper` additionally reads a
+ *     real asset so the engine's data-URL path is exercised.
  *
  * This file is Node-side harness scratch, so it is *not* bound by the ES5
  * rule that `gc-bridge.js` must obey. It is written conservatively anyway
@@ -318,6 +320,25 @@
     androidVersion: function () { return '14'; },
 
     setWallpaper: function (b64) { emit('setWallpaper', (b64 ? b64.length : 0) + ' b64 chars'); },
+    // No real phone wallpaper exists in a browser page, so stand in with a
+    // static asset the engine can actually render (`icon.png`): the data-URL
+    // path stays exercised end to end instead of short-circuiting to `null`.
+    getWallpaper: function () {
+      var b64 = readBase64(gameRootPath + '/icon.png');
+      if (typeof b64 === 'string' && b64.length > 0) {
+        emit('getWallpaper', b64.length + ' b64 chars');
+        return b64;
+      }
+      return null;
+    },
+    // A page cannot ask a yes/no question; record the ask and always decline,
+    // so nothing ever blocks waiting for an answer that can never come.
+    confirm: function (title, body) {
+      emit('confirm', String(title == null ? '' : title) + ' | ' +
+        String(body == null ? '' : body));
+      return false;
+    },
+    screenOff: function () { emit('screenOff', 'dimming the window'); },
     toast: androidCapability('toast'),
     fakeShutdown: function () { emit('shutdown', 'pretending to power off'); },
     openFile: function (p) { emit('openFile', String(p == null ? '' : p)); return false; },

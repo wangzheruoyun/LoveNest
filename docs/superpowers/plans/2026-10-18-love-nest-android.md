@@ -502,6 +502,60 @@ cd /root/LoveNest && git add -A && git commit -m "feat: add native bridge, permi
 
 ---
 
+### Task 7b: 补齐 Meta 演出缺口（壁纸读取 / qboxcom 确认框 / 熄屏）
+
+> 本节由实施阶段插入：Task 4 在实测引擎调用点时发现三处 Meta 演出无法落地，必须补齐，否则「打破第四面墙」的演出会部分缺失或用错语义。
+
+**Files:**
+- Modify: `android-app/app/src/main/assets/gc-bridge.js`
+- Modify: `android-app/app/src/main/java/com/github/wangzheruoyun/lovenest/GameBridge.kt`
+- Modify: `android-app/app/src/main/java/com/github/wangzheruoyun/lovenest/MainActivity.kt`（仅在需要放开权限/接线时）
+- Modify: `tools/headless/host-native.js`、`tools/headless/inpage-host.js`
+- Modify: `tools/headless/bridge.test.js`
+
+**Interfaces:**
+- Produces: `__GCNative` 契约第 22–24 个方法（同步、失败不抛、返回 `null`/`false`）：
+  - `getWallpaper() -> String|null` — 当前壁纸的 base64（无法读取时 `null`）
+  - `confirm(title, body) -> Boolean` — 阻塞式确认框；`true` 表示用户选了「是」
+  - `screenOff() -> void` — 熄屏（`offMonitor` 的安卓等价物）
+- Consumes: 现有 21 方法契约、`gc-bridge.js` 的 `fs`/`child_process` 路由、Task 7 的 `AssetSource`
+
+**背景（Task 4 实测结论，均为引擎真实行为）：**
+1. 壁纸**读取**演出：`W26_DesktopWallpaper` 经 `fs` + `process.env.APPDATA` 读 `\Microsoft\Windows\Themes\` 下的真实壁纸文件；安卓上没有该路径，读取必然失败，演出变空。
+2. `nircmd qboxcom`：`showMessage_yes` 要求 `stdout.trim() == "yes"` 才置 `flag = true`（`rv.js:98169`）；当前路由返回 `''`，因此永远走「否」分支，玩家无法回答「是」。
+3. `offMonitor`（`scrnsave.scr /s`）：目前只写日志，不熄屏。
+
+- [ ] **Step 1: 写失败测试（桩层三处路由）**
+
+在 `tools/headless/bridge.test.js` 追加断言：`child_process` 路由到 `confirm` 并据其返回值产出 `'yes'`/`''`；`offMonitor` 命令路由到 `screenOff()`；读 `APPDATA` 壁纸路径时走 `getWallpaper()` 并返回真实字节。
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd tools/headless && node --test bridge.test.js`
+Expected: FAIL —— 三条新断言失败，其余保持通过。
+
+- [ ] **Step 3: 三处宿主接口同步实现**
+
+`gc-bridge.js` 新增三条路由；`host-native.js`（Node 真文件系统）、`inpage-host.js`（无头，`getWallpaper` 返回一张真实存在的图片字节、`confirm` 记录并返回 `false`、`screenOff` 记日志）、`GameBridge.kt`（`WallpaperManager.getDrawable()` → base64；`AlertDialog` 确认框须回主线程同步取值；熄屏用 `WindowManager.LayoutParams.screenBrightness = 0` 或等效手段）三处**同名同签名**。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cd tools/headless && node --test`
+Expected: PASS，且输出整洁。
+
+- [ ] **Step 5: 无头回归**
+
+Run: `node tools/headless/run.js --inject; echo "exit=$?"`
+Expected: `exit=0`、`pageerrors = 0`、`os.platform === 2`、`main calls = 1`。若 `getWallpaper` 路由被引擎触发，`out/console.log` 中可见对应 host 日志。
+
+- [ ] **Step 6: CI 保持绿（含 `:app:testDebugUnitTest`）并提交**
+
+```bash
+cd /root/LoveNest && git add -A && git commit -m "feat: close the three remaining meta-performance gaps"
+```
+
+---
+
 ### Task 8: 正式签名 + Release 自动出包
 
 **Files:**
