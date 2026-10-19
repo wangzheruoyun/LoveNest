@@ -31,6 +31,19 @@
     <string name="exit_confirm_cancel">取消</string>
 
     <!--
+      Task 12 diagnostic build: the back key opens a menu instead of the plain
+      exit confirm. The dump and the context-loss simulation used to live on the
+      volume keys; the keys are handed back to the platform, and these
+      instruments are reached from here. All of it goes away with the
+      diagnostic switch (see SHOW_DIAG_MENU).
+    -->
+    <string name="back_menu_title">爱之巢 · 诊断菜单</string>
+    <string name="back_menu_message">选择要执行的操作。「退出游戏」会丢失未保存的进度。</string>
+    <string name="back_menu_dump">写入诊断 dump</string>
+    <string name="back_menu_context_loss">模拟渲染上下文丢失（画面会短暂变黑）</string>
+    <string name="back_menu_exit">退出游戏</string>
+
+    <!--
       Task 11: the renderer-death verdict. Reported for the diagnostic run; it
       is also the only in-app recovery from a dead renderer, which is otherwise
       a permanently black screen until the app is killed.

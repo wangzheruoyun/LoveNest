@@ -920,8 +920,8 @@
     resources: [],
     factsLogged: false,
     // Task 13: the one-shot framebuffer sample request. A trigger (timer /
-    // STALL / volume-down) only *arms* this; the read itself happens inside
-    // the engine's next rAF callback frame (see diagRunCanvasSample).
+    // STALL / the back-key menu) only *arms* this; the read itself happens
+    // inside the engine's next rAF callback frame (see diagRunCanvasSample).
     fbSamplePending: 0,
     fbSampleReason: ''
   };
@@ -1100,11 +1100,12 @@
 
   /**
    * Arm exactly one framebuffer sample. Triggers — the t+8/16/30 s timers, the
-   * STALL detector (through the native `SAMPLE_FB_*` call) and volume-down —
-   * only set this flag; the read itself runs from `diagRunCanvasSample()`,
-   * which is invoked from the rAF wrapper. Several triggers before that frame
-   * collapse into one sample (the newest reason wins). This is the entry point
-   * the native side calls as `window.__gcDiagSampleCanvas(reason)`.
+   * STALL detector (through the native `SAMPLE_FB_*` call) and the back-key
+   * menu's dump — only set this flag; the read itself runs from
+   * `diagRunCanvasSample()`, which is invoked from the rAF wrapper. Several
+   * triggers before that frame collapse into one sample (the newest reason
+   * wins). This is the entry point the native side calls as
+   * `window.__gcDiagSampleCanvas(reason)`.
    */
   function diagRequestCanvasSample(reason) {
     diagState.fbSamplePending = 1;

@@ -204,3 +204,23 @@ node transition-probe.js --seconds 25 --ua-mobile   # 修复前：地标全 fals
 node transition-probe.js --seconds 25               # 桌面：地标全 true
 node --test --test-name-pattern='onPC'              # 单测
 ```
+
+# 诊断入口迁移到返回键菜单（`v1.0.0-fix2`）
+
+`v1.0.0-fix1` 的真机验收通过（进入第一幕有画面、有声音、可操作）。随后把原来占用音量键的两个
+诊断仪器搬到**返回键弹出的菜单**，把音量键交还系统：
+
+| 旧（`v1.0.0-diag3` / `fix1`） | 新（`v1.0.0-fix2`） |
+|---|---|
+| `dispatchKeyEvent` 拦截音量键 | 不再拦截；音量加减走系统行为 |
+| **音量减** → `dumpOnDemand()` | 返回键 → 菜单「写入诊断 dump」 |
+| **音量加** → 模拟 WebGL 上下文丢失 | 返回键 → 菜单「模拟渲染上下文丢失」 |
+| 返回键 → 「确定要退出吗？」确认框 | 返回键 → 菜单（dump / 上下文丢失 / 退出游戏） |
+
+- 返回键仍然先向页面派发一次合成 Escape（交还给游戏 UI），再弹菜单，顺序不变。
+- `showBackMenu()` 由 `SHOW_DIAG_MENU` 单一开关控制；置 `false` 时返回键回落到原来的
+  退出确认框（`confirmExit()`），正式版只保留「未保存进度」提示这条职责。
+- 日志里的来源标记随之一致：`DUMP source=back-menu`、`CTXSIM requested source=back-menu`，
+  帧缓冲采样原因 `window.__gcDiagSampleCanvas('back-menu')`。
+- 菜单项「退出游戏」即等同旧确认框的同意项，因此不再二次确认；点菜单外或按返回键即取消。
+

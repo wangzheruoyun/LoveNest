@@ -19,7 +19,6 @@ import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
-import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
@@ -96,7 +95,8 @@ class MainActivity : Activity() {
     private var gameBridge: GameBridge? = null
     private var gameStarted = false
     private var bridgeFailureReported = false
-    private var exitDialogShowing = false
+    /** Guards the back-key dialog (diag menu or plain exit confirm) against re-entry. */
+    private var backDialogShowing = false
 
     /* ---- Task 11 diagnostics ------------------------------------------ */
 
@@ -889,50 +889,66 @@ class MainActivity : Activity() {
             return
         }
         dispatchEscapeKey()
-        confirmExit()
+        // The diagnostic build answers the back key with a menu: Task 12's dump
+        // and context-loss instruments used to live on the volume keys, which
+        // are handed back to the system here.
+        if (SHOW_DIAG_MENU) showBackMenu() else confirmExit()
     }
 
     /* ------------------------------------------------------------------ *
-     * Task 12 — volume keys (diagnostic build only)
+     * Back-key menu (Task 12 instruments, moved off the volume keys)
      *
-     * The Activity's key path is alive even when the page is not (the back key
-     * already proves it), and the WebView may otherwise eat a volume key. So
-     * the keys are intercepted here, before the view hierarchy:
+     * These instruments are acceptable **only in this diagnostic build** and
+     * must be switched off before the final release. [SHOW_DIAG_MENU] is the
+     * single switch; with it false the back key falls back to the plain exit
+     * confirmation below.
      *
-     *   volume-down → write the same dump `__gcDiagDump()` returns, immediately
-     *   volume-up   → simulate a WebGL context loss on the engine's canvas
-     *
-     * Both are acceptable **only in this diagnostic build** and must be removed
-     * before the final release. [CAPTURE_VOLUME_KEYS] is the single switch.
+     * The volume keys are deliberately *not* intercepted any more: the Activity
+     * key path used to eat them, which broke the platform's own volume
+     * behaviour in a build the player actually uses.
      * ------------------------------------------------------------------ */
 
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (CAPTURE_VOLUME_KEYS && gameStarted && diag != null && webView != null &&
-            event.action == KeyEvent.ACTION_DOWN
-        ) {
-            when (event.keyCode) {
-                KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                    dumpOnDemand()
-                    return true
-                }
-
-                KeyEvent.KEYCODE_VOLUME_UP -> {
-                    // Ignore auto-repeat: one loss per press, not per repeat tick.
-                    if (event.repeatCount == 0) {
-                        simulateContextLoss()
-                        return true
+    /**
+     * The back key's dialog in the diagnostic build: write a dump, simulate a
+     * WebGL context loss, or quit. Dismissing the dialog (outside tap or back)
+     * cancels and never touches the game.
+     */
+    private fun showBackMenu() {
+        if (backDialogShowing || isFinishing || isDestroyed) return
+        backDialogShowing = true
+        try {
+            AlertDialog.Builder(this)
+                .setTitle(R.string.back_menu_title)
+                .setMessage(R.string.back_menu_message)
+                .setItems(
+                    arrayOf<CharSequence>(
+                        getString(R.string.back_menu_dump),
+                        getString(R.string.back_menu_context_loss),
+                        getString(R.string.back_menu_exit)
+                    )
+                ) { _, which ->
+                    when (which) {
+                        0 -> dumpOnDemand()
+                        1 -> simulateContextLoss()
+                        2 -> finish()
+                        else -> Unit
                     }
                 }
-            }
+                // Cancel (or back on the dialog) lands here too, so the menu can
+                // be reopened on the next press.
+                .setOnDismissListener { backDialogShowing = false }
+                .show()
+        } catch (_: Exception) {
+            // A dialog that cannot be shown must not wedge the back button.
+            backDialogShowing = false
         }
-        return super.dispatchKeyEvent(event)
     }
 
-    /** Volume-down: write the page dump to the log right now. */
+    /** The menu's "写入诊断 dump": write the page dump to the log right now. */
     private fun dumpOnDemand() {
         val log = diag ?: return
         val view = webView ?: return
-        log.log("DUMP source=volume-down")
+        log.log("DUMP source=back-menu")
         // Task 13: arm a framebuffer sample; it runs inside the engine's next
         // rAF frame and writes its own `FB sample …` line.
         try {
@@ -943,18 +959,18 @@ class MainActivity : Activity() {
         try {
             view.evaluateJavascript(DUMP_JS) { raw ->
                 val data = unwrapJsonString(raw)?.toString() ?: "null"
-                log.log("DUMP source=volume-down data=$data")
+                log.log("DUMP source=back-menu data=$data")
             }
         } catch (e: Exception) {
-            log.log("DUMP source=volume-down data=error:${e.javaClass.simpleName}")
+            log.log("DUMP source=back-menu data=error:${e.javaClass.simpleName}")
         }
     }
 
-    /** Volume-up: ask the page to lose and restore the engine's WebGL context. */
+    /** The menu's "模拟上下文丢失": ask the page to lose and restore its WebGL context. */
     private fun simulateContextLoss() {
         val log = diag ?: return
         val view = webView ?: return
-        log.log("CTXSIM requested source=volume-up")
+        log.log("CTXSIM requested source=back-menu")
         try {
             view.evaluateJavascript(LOSE_CONTEXT_JS) { raw ->
                 log.log("CTXSIM result=" + (raw?.trim('"') ?: "null"))
@@ -970,9 +986,14 @@ class MainActivity : Activity() {
         view.evaluateJavascript(BACK_KEY_JS, null)
     }
 
+    /**
+     * The final-release dialog: the platform back gesture is never allowed to
+     * silently kill a running game. Used instead of [showBackMenu] when
+     * [SHOW_DIAG_MENU] is off.
+     */
     private fun confirmExit() {
-        if (exitDialogShowing || isFinishing || isDestroyed) return
-        exitDialogShowing = true
+        if (backDialogShowing || isFinishing || isDestroyed) return
+        backDialogShowing = true
         try {
             AlertDialog.Builder(this)
                 .setTitle(R.string.exit_confirm_title)
@@ -981,11 +1002,11 @@ class MainActivity : Activity() {
                 .setNegativeButton(R.string.exit_confirm_cancel, null)
                 // Cancel (or back on the dialog) lands here too, so the dialog can
                 // be reopened on the next press.
-                .setOnDismissListener { exitDialogShowing = false }
+                .setOnDismissListener { backDialogShowing = false }
                 .show()
         } catch (_: Exception) {
             // A dialog that cannot be shown must not wedge the back button.
-            exitDialogShowing = false
+            backDialogShowing = false
         }
     }
 
@@ -1102,15 +1123,15 @@ class MainActivity : Activity() {
         const val STALL_DUMP_TIMEOUT_MS = 1500L
 
         /**
-         * Task 12 diagnostic-build-only key capture: volume-down dumps the page
-         * state, volume-up simulates a WebGL context loss.
+         * Task 12 diagnostic-build-only switch: the back key opens the
+         * dump / context-loss / quit menu instead of the plain exit confirm.
          *
-         * This is acceptable **only** in this diagnostic build and must be
-         * switched off (or the `dispatchKeyEvent` override removed) before the
-         * final release, so the shipped app keeps the platform's volume
-         * behaviour. See the Task 12 report.
+         * The instruments themselves are acceptable **only** in this diagnostic
+         * build and must be switched off before the final release, so the shipped
+         * app's back key only offers the unsaved-work confirmation. The volume
+         * keys are no longer intercepted at all.
          */
-        const val CAPTURE_VOLUME_KEYS = true
+        const val SHOW_DIAG_MENU = true
 
         /**
          * What `shouldInterceptRequest` prepends to `script.js` (Ruling C), plus
@@ -1157,7 +1178,7 @@ class MainActivity : Activity() {
         /**
          * The on-demand dump: the pending request table, the resource ring
          * buffer, audio state, canvas/GL facts and every counter, as one JSON
-         * string. Used by volume-down and by the STALL record.
+         * string. Used by the back-key menu and by the STALL record.
          */
         const val DUMP_JS = """
             (function () {
@@ -1190,7 +1211,7 @@ class MainActivity : Activity() {
             (function () {
               try {
                 if (window.__gcDiagSampleCanvas) {
-                  window.__gcDiagSampleCanvas('volume-down');
+                  window.__gcDiagSampleCanvas('back-menu');
                   return true;
                 }
               } catch (e) {}
@@ -1199,7 +1220,7 @@ class MainActivity : Activity() {
         """
 
         /**
-         * Volume-up: lose the engine's WebGL context through
+         * The menu's "模拟上下文丢失": lose the engine's WebGL context through
          * `WEBGL_lose_context`, restore it after 2 s, and let the shim log what
          * the engine does. A device-local reproduction loop for the black screen
          * that does not need the scene transition.
