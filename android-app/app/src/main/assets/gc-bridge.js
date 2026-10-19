@@ -2989,6 +2989,83 @@
   };
 
   /* ------------------------------------------------------------------ *
+   * Desktop parity: Laya's `Browser.onPC`
+   *
+   * Two of the engine's file-system functions branch on `Browser.onPC` and
+   * have no `else`, so the mobile path drops their completion callback:
+   *
+   *     FileUtils.createDirectoryForce = function (localURL, onFin, ...) {
+   *         var taskF = function () {
+   *             var onCreateDirectoryFin = Callback.New(function (success) {
+   *                 onFin && onFin.runWith([success, localURL]);
+   *                 if (taskLock)
+   *                     SyncTask.taskOver(FileUtils.TASK_MODIFY_FILE);   // <- here
+   *             }, this);
+   *             ...
+   *             if (Browser.onPC) {                                      // <- gate
+   *                 ...
+   *                 createDirectoryForce(fullURL, function () {
+   *                     onCreateDirectoryFin.runWith([true, localURL]);     // <- dropped
+   *                 }, ...);
+   *             }
+   *         };
+   *         new SyncTask(FileUtils.TASK_MODIFY_FILE, taskF);
+   *     };
+   *
+   * `FileUtils.saveFile` has the same shape ("else if (Browser.onPC) {
+   * mainDomain_fs.writeFile(...) }").
+   *
+   * Laya sets `Browser.onPC = !Browser.onMobile`, and `onMobile` is true for
+   * every phone user agent, so on Android the branch is skipped and
+   * `SyncTask.taskOver(FileUtils.TASK_MODIFY_FILE)` never runs. The file-task
+   * queue then jams on the first directory the engine tries to create: the
+   * loading bundle still finishes (its loader is independent) and the
+   * transition curtain is painted, but the default save write, the
+   * fourth-wall gags and the first scene's BGM are all queued behind a lock
+   * that is never released. The render loop keeps running against a black
+   * screen forever, with no exception and no further host call.
+   *
+   * The demo only ever shipped for Windows, where `onPC` is true, so the
+   * mobile branch is dead code that was never completed. Report desktop
+   * parity instead. Only `onPC` is set: across the whole engine it is read in
+   * exactly three places (those two branches and Laya's `TextInput` focus
+   * call), while `Browser.onMobile` is what still drives Laya's touch input
+   * binding on the device.
+   * ------------------------------------------------------------------ */
+
+  /**
+   * `Browser.__init__` assigns `onPC` lazily - on the first `Browser.*` access,
+   * and only once - which can happen after this script has run, so the value
+   * is asserted on a timer rather than once. One property read per tick for
+   * the life of the page; it gives up if Laya never appears.
+   */
+  function enforceDesktopPlatform() {
+    if (typeof setInterval !== 'function') return;
+    var idle = 0;
+    var iv = setInterval(function () {
+      var browser = null;
+      try {
+        browser = win && win.Laya && win.Laya.Browser;
+      } catch (e) {
+        return;
+      }
+      if (!browser) {
+        // No Laya after a minute: not the game, stop watching.
+        if (++idle > 240) clearInterval(iv);
+        return;
+      }
+      idle = 0;
+      try {
+        if (browser.onPC === true) return;
+        browser.onPC = true;
+        if (diagEnabled()) diagWrite('Desktop parity: Browser.onPC forced true');
+      } catch (e) {
+        // A frozen browser record must not break the boot.
+      }
+    }, 250);
+  }
+
+  /* ------------------------------------------------------------------ *
    * Publish the NW.js-ish environment
    * ------------------------------------------------------------------ */
 
@@ -3013,5 +3090,9 @@
 
     // Task 11: page-side instrumentation, only when the Activity opted in.
     installDiagnostics();
+
+    // The mobile deadlock: `Browser.onPC` gates two engine branches that own
+    // the file-task lock's release. See the section above.
+    enforceDesktopPlatform();
   }
 })();

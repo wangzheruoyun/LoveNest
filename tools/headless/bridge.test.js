@@ -1698,3 +1698,58 @@ test('没有 WebGL 上下文时写 FB sample none', () => {
   assert.ok(lines.some((s) => /^FB sample none t=\d+ reason=no-context$/.test(s)),
     '没有 WebGL 上下文必须写 FB sample none：' + lines.join(' | '));
 });
+
+/**
+ * `Browser.onPC` — the mobile black screen.
+ *
+ * `FileUtils.createDirectoryForce` / `FileUtils.saveFile` branch on
+ * `Browser.onPC` and have no `else`: the callback that releases
+ * `SyncTask.taskOver(FileUtils.TASK_MODIFY_FILE)` is simply dropped when the
+ * flag is false. Laya computes `onPC = !onMobile`, so on a phone the file-task
+ * queue jams on the first directory the engine creates and the whole post-load
+ * sequence (save write, fourth-wall gags, first scene) never runs.
+ *
+ * The shim must report desktop parity for that one flag. It must *not* touch
+ * `Browser.onMobile`, which still drives Laya's real touch binding.
+ */
+function loadBridgeWithTimers(host) {
+  const ticks = [];
+  const sandbox = {
+    window: {}, console, __GCNative: host, setTimeout, clearTimeout, Date, JSON, Math,
+    setInterval: (fn) => { ticks.push(fn); return ticks.length; },
+    clearInterval: () => {}
+  };
+  sandbox.window.window = sandbox.window;
+  sandbox.globalThis = sandbox.window;
+  vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(BRIDGE_PATH, 'utf8'), sandbox);
+  return { w: sandbox.window, ticks };
+}
+
+test('Browser 尚未出现时，onPC 看门狗不抛异常也不误伤', () => {
+  const { w, ticks } = loadBridgeWithTimers(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  assert.strictEqual(ticks.length, 1, '必须只注册一个 onPC 看门狗');
+  ticks[0](); // no Laya yet
+  assert.strictEqual(w.Laya, undefined);
+});
+
+test('手机 UA（onPC=false）下，onPC 被强制为 true 而 onMobile 保持不动', () => {
+  const { w, ticks } = loadBridgeWithTimers(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const browser = { onPC: false, onMobile: true, onAndriod: true };
+  w.Laya = { Browser: browser };
+  ticks[0]();
+  assert.strictEqual(browser.onPC, true,
+    'Browser.onPC 为 false 会让 FileUtils 的移动端分支吞掉 SyncTask 解锁回调');
+  assert.strictEqual(browser.onMobile, true,
+    'onMobile 驱动 Laya 的触摸绑定，必须保持设备真实值');
+  assert.strictEqual(browser.onAndriod, true);
+});
+
+test('onPC 已为 true 时不重写（桌面运行保持惰性）', () => {
+  const { w, ticks } = loadBridgeWithTimers(createHost({ gameRoot: GAME_ROOT, docsRoot: '/tmp/d' }));
+  const browser = { onPC: true, onMobile: false };
+  w.Laya = { Browser: browser };
+  ticks[0]();
+  assert.strictEqual(browser.onPC, true);
+  assert.strictEqual(browser.onMobile, false);
+});
