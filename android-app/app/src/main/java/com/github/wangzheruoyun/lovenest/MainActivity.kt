@@ -32,6 +32,7 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.SequenceInputStream
+import java.util.Collections
 
 /**
  * How `gc-bridge.js` gets in front of the engine.
@@ -261,11 +262,23 @@ class MainActivity : Activity() {
         val url = request.url?.toString() ?: return null
         val script = scriptFileFor(url) ?: return null
         return try {
-            val prefix = "$WINDOW_NATIVE_ALIAS\n".toByteArray(Charsets.UTF_8)
-            val body = SequenceInputStream(ByteArrayInputStream(prefix), FileInputStream(script))
-            WebResourceResponse("application/javascript", "UTF-8", body)
+            // Order matters: the alias must exist before the shim runs (it reads
+            // `window.__GCNative` at its top), and the shim must exist before the
+            // engine runs. The shim is streamed straight out of the APK's assets,
+            // never off the game folder and never re-encoded, so the bytes served
+            // are the bytes that shipped.
+            val alias = ByteArrayInputStream("$WINDOW_NATIVE_ALIAS\n".toByteArray(Charsets.UTF_8))
+            val shim = assets.open(SHIM_ASSET)
+            val engine = FileInputStream(script)
+            WebResourceResponse(
+                "application/javascript",
+                "UTF-8",
+                SequenceInputStream(Collections.enumeration(listOf(alias, shim, engine))),
+            )
         } catch (e: Exception) {
-            Log.w(TAG, "could not serve the injected script.js; the engine may fall back to platform 3", e)
+            // Returning null here is not silent: the page ends up without the
+            // shim, and the Ruling D probe reports that loudly.
+            Log.e(TAG, "could not serve the injected script.js; the engine will fall back to platform 3", e)
             null
         }
     }
@@ -503,6 +516,9 @@ class MainActivity : Activity() {
 
         /** What `shouldInterceptRequest` prepends to `script.js` (Ruling C). */
         const val WINDOW_NATIVE_ALIAS = "window.__GCNative = window.AndroidBridge;"
+
+        /** The shim, served out of the APK's assets - never off the game folder. */
+        const val SHIM_ASSET = "gc-bridge.js"
 
         /**
          * Which injection mechanism to use; `INTERCEPT_SCRIPT` is the default.
