@@ -2,6 +2,7 @@ package com.github.wangzheruoyun.lovenest
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -84,6 +85,7 @@ class MainActivity : Activity() {
     private var gameBridge: GameBridge? = null
     private var gameStarted = false
     private var bridgeFailureReported = false
+    private var exitDialogShowing = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -457,6 +459,66 @@ class MainActivity : Activity() {
     }
 
     /* ------------------------------------------------------------------ *
+     * Back button (Task 10 Step 2)
+     * ------------------------------------------------------------------ */
+
+    /**
+     * The design gives the system back gesture two duties, in this order:
+     *
+     *  1. Hand it to the in-game UI if the engine listens for it - a synthetic
+     *     Escape `keydown` on the document, which reaches `document` and `window`
+     *     listeners by bubbling.
+     *  2. Regardless of whether the engine reacted (we cannot know: the script
+     *     dispatch is fire-and-forget), ask the player before leaving. Back must
+     *     never silently kill a running game with unsaved state.
+     *
+     * The engine's own quit path is untouched: `nircmd shutdown` still works
+     * because it goes through [GameBridge.fakeShutdown], which calls `finish()`
+     * directly and never comes through here.
+     *
+     * `onBackPressed` (not `OnBackPressedDispatcher`) is deliberate: this is a
+     * plain `Activity` and the manifest does not opt into predictive back
+     * (`android:enableOnBackInvokedCallback`), so the platform still delivers the
+     * legacy callback. Pulling in `androidx.activity` for the dispatcher would be
+     * a new runtime dependency for no behavioural gain.
+     */
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+    override fun onBackPressed() {
+        if (!gameStarted) {
+            // The gate screen has no game state to protect.
+            super.onBackPressed()
+            return
+        }
+        dispatchEscapeKey()
+        confirmExit()
+    }
+
+    /** Fire the synthetic Escape and forget about it. Never throws. */
+    private fun dispatchEscapeKey() {
+        val view = webView ?: return
+        view.evaluateJavascript(BACK_KEY_JS, null)
+    }
+
+    private fun confirmExit() {
+        if (exitDialogShowing || isFinishing || isDestroyed) return
+        exitDialogShowing = true
+        try {
+            AlertDialog.Builder(this)
+                .setTitle(R.string.exit_confirm_title)
+                .setMessage(R.string.exit_confirm_message)
+                .setPositiveButton(R.string.exit_confirm_exit) { _, _ -> finish() }
+                .setNegativeButton(R.string.exit_confirm_cancel, null)
+                // Cancel (or back on the dialog) lands here too, so the dialog can
+                // be reopened on the next press.
+                .setOnDismissListener { exitDialogShowing = false }
+                .show()
+        } catch (_: Exception) {
+            // A dialog that cannot be shown must not wedge the back button.
+            exitDialogShowing = false
+        }
+    }
+
+    /* ------------------------------------------------------------------ *
      * Small helpers
      * ------------------------------------------------------------------ */
 
@@ -542,6 +604,37 @@ class MainActivity : Activity() {
 
         /** The shim, served out of the APK's assets - never off the game folder. */
         const val SHIM_ASSET = "gc-bridge.js"
+
+        /**
+         * The synthetic Escape dispatched when the player presses back, before the
+         * exit confirmation. Dispatched at `document.activeElement || document` with
+         * `bubbles`, so a listener on the element, on `document`, or on `window` all
+         * see it. `keyCode`/`which` are legacy read-only accessors, so the branch
+         * that still reads them gets them pinned explicitly; the ancient
+         * `createEvent` fallback covers a WebView too old for `KeyboardEvent`.
+         */
+        const val BACK_KEY_JS = """
+            (function () {
+              try {
+                var e;
+                try {
+                  e = new KeyboardEvent('keydown', {
+                    key: 'Escape', code: 'Escape', keyCode: 27, which: 27,
+                    bubbles: true, cancelable: true
+                  });
+                  try { Object.defineProperty(e, 'keyCode', { get: function () { return 27; } }); } catch (x) {}
+                  try { Object.defineProperty(e, 'which', { get: function () { return 27; } }); } catch (x) {}
+                } catch (x) {
+                  e = document.createEvent('Event');
+                  e.initEvent('keydown', true, true);
+                  e.key = 'Escape';
+                  e.keyCode = 27;
+                  e.which = 27;
+                }
+                (document.activeElement || document).dispatchEvent(e);
+              } catch (x) {}
+            })();
+        """
 
         /**
          * Which injection mechanism to use; `INTERCEPT_SCRIPT` is the default.

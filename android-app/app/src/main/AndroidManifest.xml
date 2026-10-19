@@ -26,9 +26,17 @@
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="29" />
 
+    <!--
+      The launcher icon is the demo's own 爱之巢 artwork, copied in as the plan's
+      Task 10 Step 1 explicitly allows (the single, deliberate exception to "the
+      repo holds no game resources"). It is a 512x512 RGBA PNG in one density
+      folder; Android scales it. No android:roundIcon: we only have the square
+      source, and no image tooling exists on this machine to derive a round one.
+    -->
     <application
         android:allowBackup="false"
         android:hardwareAccelerated="true"
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
 

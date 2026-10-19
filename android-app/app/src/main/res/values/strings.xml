@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Task 10 switches the launcher label to 爱之巢. -->
-    <string name="app_name">Love Nest</string>
+    <!-- Task 10: the launcher label the user sees. -->
+    <string name="app_name">爱之巢</string>
 
     <!--
       Gate screens. The app cannot run the game without "all files access" (to
@@ -18,4 +18,15 @@
 
     <!-- Ruling D: a silent platform-3 fallback is the worst outcome of the port. -->
     <string name="bridge_missing">警告：游戏兼容层没有生效（%1$s），Meta 演出与文件存档已失效。游戏仍可运行，但结果不完整。</string>
+
+    <!--
+      Back button (Task 10 Step 2). The system back gesture is handed to the
+      in-game UI first (a synthetic Escape), then this confirms before the
+      activity is finished, so a running game with unsaved state is never
+      silently killed.
+    -->
+    <string name="exit_confirm_title">确定要退出吗？</string>
+    <string name="exit_confirm_message">确定要退出《爱之巢》吗？未保存的进度可能会丢失。</string>
+    <string name="exit_confirm_exit">退出</string>
+    <string name="exit_confirm_cancel">取消</string>
 </resources>
